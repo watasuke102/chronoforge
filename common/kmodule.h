@@ -1,0 +1,5 @@
+#pragma once
+
+#define KMODULE_IOCTL_SETUP_SCHEDULER 0
+#define KMODULE_IOCTL_SETUP_CLIENT    1
+#define KMODULE_IOCTL_START           2
