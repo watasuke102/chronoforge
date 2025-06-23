@@ -50,4 +50,4 @@ static void module_cleanup(void) {
 module_init(module_entry);
 module_exit(module_cleanup);
 
-MODULE_LICENSE("MIT");
+MODULE_LICENSE("Dual MIT/GPL");

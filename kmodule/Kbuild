@@ -1,1 +1,2 @@
 obj-m += kmodule.o
+EXTRA_CFLAGS += -I$(realpath $(PWD)/../common)
