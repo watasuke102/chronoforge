@@ -10,19 +10,35 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <list>
+#include <mutex>
+#include <thread>
 
 #include "kmodule.h"
 #include "scheduler.h"
 
-namespace {
-constexpr uint32_t EPOLL_IDENTIFIER = 0x02c0'ffee;
-}
+struct Task {
+  unsigned long long last_execution_started;
+};
 
 struct Ctx {
-  int kmodule_fd;
-  int socket_fd;
-  int epoll_fd;
+  int             kmodule_fd;
+  int             socket_fd;
+  int             epoll_fd;
+  std::thread     socket_thread;
+  std::list<Task> tasks;
+  std::mutex      tasks_mutex;
 };
+
+namespace {
+constexpr uint32_t EPOLL_IDENTIFIER = 0x02c0'ffee;
+
+unsigned long long rdtsc() {
+  unsigned long long l, h;
+  asm volatile("rdtsc" : "=a"(l), "=d"(h));
+  return l | (h << 32);
+}
+}  // namespace
 
 void poll(Ctx* ctx) {
   int                ret;
@@ -38,6 +54,12 @@ void poll(Ctx* ctx) {
     }
     if (ev.data.u32 == EPOLL_IDENTIFIER) {
       continue;
+    }
+    {
+      std::lock_guard<std::mutex> lock(ctx->tasks_mutex);
+      ctx->tasks.emplace_back((Task){
+          .last_execution_started = 0,
+      });
     }
   }
 }
@@ -85,9 +107,11 @@ int main(void) {
     goto close_epoll_fd;
   }
 
-  ioctl(ctx->kmodule_fd, KMODULE_IOCTL_SETUP_SCHEDULER, nullptr);
+  ctx->socket_thread = std::thread([&ctx] {
+    poll(ctx);
+  });
 
-  poll(ctx);
+  ioctl(ctx->kmodule_fd, KMODULE_IOCTL_SETUP_SCHEDULER, nullptr);
 
   exit_status = EXIT_SUCCESS;
 
