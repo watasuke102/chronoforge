@@ -1,13 +1,53 @@
+#include "kmodule.h"
+
 #include <linux/cdev.h>
+#include <linux/cpuidle.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/vmalloc.h>
+
+struct LocalContextPerCpu {
+  pid_t last_task_id;
+  bool  is_busy;
+
+  // basically managed by execute_task()
+  // but finally released by module_cleanup()
+  struct task_struct* running_task;  // nullable
+};
+DEFINE_PER_CPU(struct LocalContextPerCpu, cpu_local_ctx);
+
+struct SharedContextPerCpu* shm;
+
+static void setup_scheduler(void) {
+  printk(KERN_INFO "Setting up scheduler");
+}
+
+static void start_scheduling(void) {
+  __set_current_state(TASK_INTERRUPTIBLE);
+  schedule();
+  __set_current_state(TASK_RUNNING);
+}
 
 static long module_ioctl(
     struct file* file, unsigned int cmd, unsigned long arg) {
   printk(KERN_INFO "ioctl: %d", cmd);
+  switch (cmd) {
+    case KMODULE_IOCTL_SETUP_SCHEDULER:
+      setup_scheduler();
+      break;
+    case KMODULE_IOCTL_START:
+      start_scheduling();
+  }
   return 0;
+}
+
+static int module_mmap(struct file* file, struct vm_area_struct* vma) {
+  if (capable(CAP_SYS_ADMIN)) {
+    return remap_vmalloc_range(vma, (void*)shm, vma->vm_pgoff);
+  }
+  return -EACCES;
 }
 
 static int module_open(struct inode* inode, struct file* file) {
@@ -20,12 +60,85 @@ static int module_release(struct inode* inode, struct file* file) {
 static struct file_operations ops = {
     .owner          = THIS_MODULE,
     .unlocked_ioctl = module_ioctl,
+    .mmap           = module_mmap,
     .open           = module_open,
     .release        = module_release,
 };
-static struct cdev cdev;
 
-static int module_entry(void) {
+static void execute_task(struct LocalContextPerCpu* ctx, pid_t task_id) {
+  if (ctx->running_task) {
+    put_task_struct(ctx->running_task);
+    ctx->running_task = NULL;
+  }
+  rcu_read_lock();
+  struct pid* pid = find_vpid(task_id);
+  if (!pid) {
+    rcu_read_unlock();
+    return;
+  }
+  ctx->running_task = pid_task(pid, PIDTYPE_PID);
+  get_task_struct(ctx->running_task);
+  wake_up_process(ctx->running_task);
+  rcu_read_unlock();
+}
+
+static int handle_idle_enter(
+    struct cpuidle_device* device, struct cpuidle_driver* driver, int index) {
+  const int                  cpu = get_cpu();
+  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+
+  WRITE_ONCE(shm[cpu].is_busy, false);
+
+  // wait until the next task is requested (up to 8us)
+  pid_t latest_next_task_id;
+  for (int i = 0; i < 10; i++) {
+    latest_next_task_id = READ_ONCE(shm[cpu].next_task_id);
+    if (latest_next_task_id != ctx->last_task_id) {
+      break;
+    }
+    udelay(1);
+  }
+
+  if (latest_next_task_id != ctx->last_task_id) {
+    execute_task(ctx, latest_next_task_id);
+  }
+  put_cpu();
+  return index;
+}
+
+static struct cpuidle_state original_state;
+static int                  original_state_count;
+static int                  hijack_cpuidle(void) {
+  struct cpuidle_driver* driver = cpuidle_get_driver();
+  if (!driver || driver->state_count <= 0) {
+    return 1;
+  }
+
+  cpuidle_pause_and_lock();
+  original_state          = driver->states[0];
+  original_state_count    = driver->state_count;
+  driver->states[0].enter = handle_idle_enter;
+  driver->states[0].flags = CPUIDLE_FLAG_NONE;
+  driver->state_count     = 1;
+  try_module_get(driver->owner);
+  cpuidle_resume_and_unlock();
+  return 0;
+}
+static void unhijack_cpuidle(void) {
+  struct cpuidle_driver* driver = cpuidle_get_driver();
+  if (!driver) {
+    return;
+  }
+
+  cpuidle_pause_and_lock();
+  driver->states[0]   = original_state;
+  driver->state_count = original_state_count;
+  module_put(driver->owner);
+  cpuidle_resume_and_unlock();
+}
+
+static struct cdev cdev;
+static int         module_entry(void) {
   dev_t devno;
   int   ret = alloc_chrdev_region(&devno, 0, 1, "kmodule");
   if (ret) {
@@ -38,12 +151,31 @@ static int module_entry(void) {
     printk(KERN_ERR "Failed to add character device (%d)\n", ret);
     return -1;
   }
+
+  shm =
+      vmalloc_user(sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
+  if (!shm) {
+    printk(KERN_ERR "Failed to allocate shared memory\n");
+    return -ENOMEM;
+  }
+  memset(shm, 0, sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
+
   printk(KERN_INFO "Module initialized successfully\n");
   return 0;
 }
 static void module_cleanup(void) {
   cdev_del(&cdev);
   unregister_chrdev_region(cdev.dev, 1);
+  if (shm) {
+    vfree(shm);
+  }
+  int cpu;
+  for_each_online_cpu(cpu) {
+    struct LocalContextPerCpu* p = per_cpu_ptr(&cpu_local_ctx, cpu);
+    if (p->running_task) {
+      put_task_struct(p->running_task);
+    }
+  }
   printk(KERN_INFO "Module exited successfully\n");
 }
 
