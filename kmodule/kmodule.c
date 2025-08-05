@@ -137,6 +137,34 @@ static void unhijack_cpuidle(void) {
   cpuidle_resume_and_unlock();
 }
 
+static void handle_sched_switch(void* data, bool preempt,
+    struct task_struct* prev, struct task_struct* next) {
+  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  if (next != ctx->running_task) {
+    return;
+  }
+  WRITE_ONCE(shm[get_cpu()].task_started_at, rdtsc());
+}
+static struct tracepoint* sched_switch_tp;
+static void handle_for_each_tracepoint(struct tracepoint* tp, void* data) {
+  if (strncmp(tp->name, "sched_switch", strlen("sched_switch")) == 0) {
+    sched_switch_tp = tp;
+  }
+}
+static void regist_sched_switch_tracepoint(void) {
+  for_each_kernel_tracepoint(handle_for_each_tracepoint, NULL);
+  if (sched_switch_tp) {
+    tracepoint_probe_register(
+        sched_switch_tp, (void*)handle_sched_switch, NULL);
+  }
+}
+static void unregist_sched_switch_tracepoint(void) {
+  if (sched_switch_tp) {
+    tracepoint_probe_unregister(
+        sched_switch_tp, (void*)handle_sched_switch, NULL);
+  }
+}
+
 static struct cdev cdev;
 static int         module_entry(void) {
   dev_t devno;
@@ -151,6 +179,8 @@ static int         module_entry(void) {
     printk(KERN_ERR "Failed to add character device (%d)\n", ret);
     return -1;
   }
+
+  regist_sched_switch_tracepoint();
 
   shm =
       vmalloc_user(sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
@@ -169,6 +199,7 @@ static void module_cleanup(void) {
   if (shm) {
     vfree(shm);
   }
+  unregist_sched_switch_tracepoint();
   int cpu;
   for_each_online_cpu(cpu) {
     struct LocalContextPerCpu* p = per_cpu_ptr(&cpu_local_ctx, cpu);
