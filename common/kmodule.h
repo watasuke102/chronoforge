@@ -1,6 +1,10 @@
 #pragma once
 
-#include <stdbool.h>
+#ifdef _cplusplus
+#include <cstdint>
+#else
+#include <linux/types.h>
+#endif
 
 #define KMODULE_IOCTL_SETUP_SCHEDULER 0
 #define KMODULE_IOCTL_SETUP_CLIENT    1
