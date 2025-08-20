@@ -191,8 +191,6 @@ int main(void) {
     poll(ctx);
   });
 
-  ioctl(ctx->kmodule_fd, KMODULE_IOCTL_SETUP_SCHEDULER, nullptr);
-
   while (true) {
     schedule(ctx);
     std::this_thread::sleep_for(std::chrono::microseconds(10));

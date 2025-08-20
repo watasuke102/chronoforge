@@ -6,10 +6,8 @@
 #include <linux/types.h>
 #endif
 
-#define KMODULE_IOCTL_SETUP_SCHEDULER 0
-#define KMODULE_IOCTL_SETUP_CLIENT    1
-#define KMODULE_IOCTL_START           2
-#define KMODULE_IOCTL_INTR            3
+#define KMODULE_IOCTL_START 0
+#define KMODULE_IOCTL_INTR  1
 
 struct SharedContextPerCpu {
   bool     is_busy;

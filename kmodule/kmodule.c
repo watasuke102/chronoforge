@@ -20,10 +20,6 @@ DEFINE_PER_CPU(struct LocalContextPerCpu, cpu_local_ctx);
 
 struct SharedContextPerCpu* shm;
 
-static void setup_scheduler(void) {
-  printk(KERN_INFO "Setting up scheduler");
-}
-
 static void start_scheduling(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
@@ -34,9 +30,6 @@ static long module_ioctl(
     struct file* file, unsigned int cmd, unsigned long arg) {
   printk(KERN_INFO "ioctl: %d", cmd);
   switch (cmd) {
-    case KMODULE_IOCTL_SETUP_SCHEDULER:
-      setup_scheduler();
-      break;
     case KMODULE_IOCTL_START:
       start_scheduling();
   }
