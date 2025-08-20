@@ -173,6 +173,11 @@ static int         module_entry(void) {
     return -1;
   }
 
+  if (hijack_cpuidle() != 0) {
+    printk(KERN_ERR "Failed to hijack cpuidle\n");
+    return -1;
+  }
+
   regist_sched_switch_tracepoint();
 
   shm =
@@ -200,6 +205,7 @@ static void module_cleanup(void) {
       put_task_struct(p->running_task);
     }
   }
+  unhijack_cpuidle();
   printk(KERN_INFO "Module exited successfully\n");
 }
 
