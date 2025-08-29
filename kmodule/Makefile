@@ -27,6 +27,7 @@ install: $(BUILD_DIR)/$(MODULE_NAME).ko
 	sudo kmodsign sha512 $(MODULE_KEY) $(MODULE_X509) $<
 	sudo $(MAKE) -C $(KERNEL_DIR) M=$(BUILD_DIR) src=$(PWD) modules_install
 	sudo depmod -A
+	sudo insmod $<
 uninstall:
 	sudo rmmod $(MODULE_NAME)
 

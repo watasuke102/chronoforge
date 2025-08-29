@@ -173,13 +173,6 @@ static int         module_entry(void) {
     return -1;
   }
 
-  if (hijack_cpuidle() != 0) {
-    printk(KERN_ERR "Failed to hijack cpuidle\n");
-    return -1;
-  }
-
-  regist_sched_switch_tracepoint();
-
   shm =
       vmalloc_user(sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
   if (!shm) {
@@ -187,6 +180,11 @@ static int         module_entry(void) {
     return -ENOMEM;
   }
   memset(shm, 0, sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
+
+  if (hijack_cpuidle() != 0) {
+    printk(KERN_ERR "Failed to hijack cpuidle\n");
+    return -1;
+  }
 
   printk(KERN_INFO "Module initialized successfully\n");
   return 0;

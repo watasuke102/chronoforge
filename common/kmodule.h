@@ -1,6 +1,6 @@
 #pragma once
 
-#ifdef _cplusplus
+#ifdef __cplusplus
 #include <cstdint>
 #else
 #include <linux/types.h>
