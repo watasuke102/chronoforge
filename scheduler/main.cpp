@@ -70,11 +70,11 @@ void poll(Ctx* ctx) {
     do {
       ret = epoll_wait(ctx->epoll_fd, &ev, 1, -1);
     } while (ret == -1 && errno == EINTR);
-    if (ret != -1) {
-      std::printf("epoll_wait error (ret: %d)\n", ret);
+    if (ret == -1) {
+      std::perror("epoll_wait error");
       break;
     }
-    if (ev.data.u32 == EPOLL_IDENTIFIER) {
+    if (ev.data.u32 != EPOLL_IDENTIFIER) {
       continue;
     }
     const int fd = accept(ctx->socket_fd, nullptr, nullptr);
@@ -85,6 +85,7 @@ void poll(Ctx* ctx) {
       close(fd);
       continue;
     }
+    std::printf("[debug] new task: pid=%d\n", optval.pid);
     {
       std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
       ctx->runqueue.emplace_back(optval.pid, fd);
@@ -93,6 +94,9 @@ void poll(Ctx* ctx) {
 }
 
 void execute_task(Ctx* ctx, int cpu) {
+  if (ctx->runqueue.size() == 0) {
+    return;
+  }
   pid_t next_task_id;
   {
     std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
@@ -130,17 +134,17 @@ int main(void) {
   Ctx*        ctx = new Ctx();
 
   {
-    constexpr timespec sleep_time = {.tv_nsec = 500'000'000 /* == 0.5sec*/};
-    timespec           t_start, t_end;
+    timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC_RAW, &t_start);
     const auto start = rdtsc();
-    nanosleep(&sleep_time, NULL);
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
     clock_gettime(CLOCK_MONOTONIC_RAW, &t_end);
     const auto     end = rdtsc();
     const uint64_t ns  = ((t_end.tv_sec - t_start.tv_sec) * 1E9) +
                         (t_end.tv_nsec - t_start.tv_nsec);
     const double secs  = static_cast<double>(ns) / 1000.0;
     ctx->cycles_per_us = (end - start) / secs;
+    std::printf("[info] CPU frequency: %.2u cycles/us\n", ctx->cycles_per_us);
   }
 
   ctx->kmodule_fd = open("/dev/kmodule", O_RDWR);
@@ -191,6 +195,8 @@ int main(void) {
   ctx->socket_thread = std::thread([&ctx] {
     poll(ctx);
   });
+
+  std::puts("[info] Scheduler started");
 
   while (true) {
     schedule(ctx);
