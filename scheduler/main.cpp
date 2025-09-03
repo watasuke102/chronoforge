@@ -120,6 +120,7 @@ void schedule(Ctx* ctx) {
       execute_task(ctx, i);
     }
   }
+  ioctl(ctx->kmodule_fd, KMODULE_IOCTL_INTR);
 }
 }  // namespace
 

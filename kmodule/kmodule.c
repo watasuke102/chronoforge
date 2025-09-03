@@ -2,15 +2,17 @@
 
 #include <linux/cdev.h>
 #include <linux/cpuidle.h>
+#include <linux/delay.h>
 #include <linux/fs.h>
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/tracepoint.h>
+#include <linux/types.h>
 #include <linux/vmalloc.h>
 
 struct LocalContextPerCpu {
   pid_t last_task_id;
-  bool  is_busy;
 
   // basically managed by execute_task()
   // but finally released by module_cleanup()
@@ -20,10 +22,42 @@ DEFINE_PER_CPU(struct LocalContextPerCpu, cpu_local_ctx);
 
 struct SharedContextPerCpu* shm;
 
+static void execute_task(
+    struct LocalContextPerCpu* ctx, pid_t task_id, int cpu_index) {
+  if (ctx->running_task) {
+    put_task_struct(ctx->running_task);
+    ctx->running_task = NULL;
+  }
+  rcu_read_lock();
+  struct pid* pid = find_vpid(task_id);
+  if (!pid) {
+    rcu_read_unlock();
+    return;
+  }
+  ctx->running_task = pid_task(pid, PIDTYPE_PID);
+  get_task_struct(ctx->running_task);
+  wake_up_process(ctx->running_task);
+  rcu_read_unlock();
+
+  WRITE_ONCE(shm[cpu_index].is_busy, false);
+  WRITE_ONCE(shm[cpu_index].next_task_id, 0);
+}
+
 static void start_scheduling(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
+}
+
+static void process_ipi_from_scheduler(void) {
+  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
+    pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
+    if (ctx->running_task->pid == next_task_id) {
+      return;
+    }
+    execute_task(ctx, next_task_id, i);
+  }
 }
 
 static long module_ioctl(
@@ -32,6 +66,10 @@ static long module_ioctl(
   switch (cmd) {
     case KMODULE_IOCTL_START:
       start_scheduling();
+      break;
+    case KMODULE_IOCTL_INTR:
+      process_ipi_from_scheduler();
+      break;
   }
   return 0;
 }
@@ -58,29 +96,18 @@ static struct file_operations ops = {
     .release        = module_release,
 };
 
-static void execute_task(struct LocalContextPerCpu* ctx, pid_t task_id) {
-  if (ctx->running_task) {
-    put_task_struct(ctx->running_task);
-    ctx->running_task = NULL;
-  }
-  rcu_read_lock();
-  struct pid* pid = find_vpid(task_id);
-  if (!pid) {
-    rcu_read_unlock();
-    return;
-  }
-  ctx->running_task = pid_task(pid, PIDTYPE_PID);
-  get_task_struct(ctx->running_task);
-  wake_up_process(ctx->running_task);
-  rcu_read_unlock();
-}
-
 static int handle_idle_enter(
     struct cpuidle_device* device, struct cpuidle_driver* driver, int index) {
   const int                  cpu = get_cpu();
   struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
 
   WRITE_ONCE(shm[cpu].is_busy, false);
+
+  if (shm[cpu].next_task_id == 0) {
+    put_cpu();
+    return index;
+  }
+  printk(KERN_INFO "next task: (%d)\n", shm[cpu].next_task_id);
 
   // wait until the next task is requested (up to 8us)
   pid_t latest_next_task_id;
@@ -93,7 +120,7 @@ static int handle_idle_enter(
   }
 
   if (latest_next_task_id != ctx->last_task_id) {
-    execute_task(ctx, latest_next_task_id);
+    execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
   return index;
@@ -136,7 +163,9 @@ static void handle_sched_switch(void* data, bool preempt,
   if (next != ctx->running_task) {
     return;
   }
-  WRITE_ONCE(shm[get_cpu()].task_started_at, rdtsc());
+  const int cpu = get_cpu();
+  WRITE_ONCE(shm[cpu].task_started_at, rdtsc());
+  put_cpu();
 }
 static struct tracepoint* sched_switch_tp;
 static void handle_for_each_tracepoint(struct tracepoint* tp, void* data) {
@@ -185,6 +214,8 @@ static int         module_entry(void) {
     printk(KERN_ERR "Failed to hijack cpuidle\n");
     return -1;
   }
+
+  regist_sched_switch_tracepoint();
 
   printk(KERN_INFO "Module initialized successfully\n");
   return 0;
