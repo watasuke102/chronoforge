@@ -29,5 +29,6 @@ install: $(BUILD_DIR)/$(MODULE_NAME).ko
 	sudo depmod -A
 	sudo insmod $<
 uninstall:
+	sudo rm -f /dev/$(MODULE_NAME)
 	sudo rmmod $(MODULE_NAME)
 

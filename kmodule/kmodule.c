@@ -53,7 +53,7 @@ static void process_ipi_from_scheduler(void) {
   struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
     pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
-    if (ctx->running_task->pid == next_task_id) {
+    if (ctx->running_task && ctx->running_task->pid == next_task_id) {
       return;
     }
     execute_task(ctx, next_task_id, i);
