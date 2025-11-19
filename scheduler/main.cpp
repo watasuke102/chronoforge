@@ -6,6 +6,7 @@
 #include <sys/un.h>
 #include <unistd.h>
 
+#include <algorithm>
 #include <bitset>
 #include <cassert>
 #include <cerrno>
@@ -93,7 +94,7 @@ void poll(Ctx* ctx) {
   }
 }
 
-void execute_task(Ctx* ctx, int cpu) {
+void enqueue_execute_task(Ctx* ctx, int cpu) {
   if (ctx->runqueue.size() == 0) {
     return;
   }
@@ -105,25 +106,44 @@ void execute_task(Ctx* ctx, int cpu) {
         ctx->running_tasks.end(), ctx->runqueue, ctx->runqueue.begin());
   }
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
+  std::printf("[debug] scheduled task %d on cpu %d\n", next_task_id, cpu);
+}
+void enqueue_park_task(Ctx* ctx, int cpu) {
+  const pid_t task_id = READ_ONCE(ctx->shm[cpu].running_task_id);
+  {
+    std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
+    auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
+        [task_id](const Task& t) {
+          return t.task_id() == task_id;
+        });
+    if (it == ctx->running_tasks.end()) {
+      std::printf("[error] failed to find task %d to park\n", task_id);
+      return;
+    }
+    ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
+  }
+  WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
+  std::printf("[debug] request park for task %d on cpu %d\n", task_id, cpu);
 }
 
 void schedule(Ctx* ctx) {
   constexpr uint32_t TASK_QUANTUM_US = 10;
-  if (ctx->runqueue.empty()) {
-    return;
-  }
 
   const auto now = rdtsc();
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
     if (READ_ONCE(ctx->shm[i].is_busy)) {
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
+      std::printf("[debug] time slice for cpu %d (elapsed: %ld)\n", i,
+          now - task_started_at);
       if (now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
-        execute_task(ctx, i);
+        enqueue_park_task(ctx, i);
+        enqueue_execute_task(ctx, i);
       }
-    } else {
-      execute_task(ctx, i);
+    } else if (ctx->runqueue.size() > 0) {
+      enqueue_execute_task(ctx, i);
     }
   }
+  // dispatch enqueued requests
   ioctl(ctx->kmodule_fd, KMODULE_IOCTL_INTR);
 }
 }  // namespace
@@ -153,12 +173,13 @@ int main(void) {
     goto delete_ctx;
   }
   ctx->shm = static_cast<SharedContextPerCpu*>(
-      mmap(NULL, sizeof(SharedContextPerCpu) * 64, PROT_READ | PROT_WRITE,
-          MAP_SHARED, ctx->kmodule_fd, 0));
+      mmap(NULL, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN,
+          PROT_READ | PROT_WRITE, MAP_SHARED, ctx->kmodule_fd, 0));
   if (ctx->shm == MAP_FAILED) {
     std::printf("Failed to mmap /dev/kmodule (%s)\n", strerror(errno));
     goto close_kmodule_fd;
   }
+  std::memset(ctx->shm, 0, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
 
   std::memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;

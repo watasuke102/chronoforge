@@ -31,6 +31,7 @@ static void execute_task(
   rcu_read_lock();
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
+    printk(KERN_WARNING "failed to find pid (%d)\n", task_id);
     rcu_read_unlock();
     return;
   }
@@ -39,8 +40,10 @@ static void execute_task(
   wake_up_process(ctx->running_task);
   rcu_read_unlock();
 
-  WRITE_ONCE(shm[cpu_index].is_busy, false);
+  WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].next_task_id, 0);
+  WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
+  printk(KERN_INFO "executed task (%d) on cpu %d\n", task_id, cpu_index);
 }
 
 static void start_scheduling(void) {
@@ -52,23 +55,41 @@ static void start_scheduling(void) {
 static void process_ipi_from_scheduler(void) {
   struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
-    pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
-    if (ctx->running_task && ctx->running_task->pid == next_task_id) {
-      return;
+    if (ctx->running_task && READ_ONCE(shm[i].is_park_requested)) {
+      send_sig(SIGUSR1, ctx->running_task, 0);
+      WRITE_ONCE(shm[i].is_park_requested, false);
+      continue;
     }
-    execute_task(ctx, next_task_id, i);
+    pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
+    if (next_task_id != 0 && ctx->running_task &&
+        ctx->running_task->pid != next_task_id) {
+      execute_task(ctx, next_task_id, i);
+    }
   }
+}
+
+static void park_task(void) {
+  const int cpu = get_cpu();
+  WRITE_ONCE(shm[cpu].is_park_requested, true);
+  WRITE_ONCE(shm[cpu].is_busy, false);
+  put_cpu();
+
+  __set_current_state(TASK_INTERRUPTIBLE);
+  schedule();
+  __set_current_state(TASK_RUNNING);
 }
 
 static long module_ioctl(
     struct file* file, unsigned int cmd, unsigned long arg) {
-  printk(KERN_INFO "ioctl: %d", cmd);
   switch (cmd) {
     case KMODULE_IOCTL_START:
       start_scheduling();
       break;
     case KMODULE_IOCTL_INTR:
       process_ipi_from_scheduler();
+      break;
+    case KMODULE_IOCTL_PARK:
+      park_task();
       break;
   }
   return 0;
@@ -113,13 +134,13 @@ static int handle_idle_enter(
   pid_t latest_next_task_id;
   for (int i = 0; i < 10; i++) {
     latest_next_task_id = READ_ONCE(shm[cpu].next_task_id);
-    if (latest_next_task_id != ctx->last_task_id) {
+    if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
       break;
     }
     udelay(1);
   }
 
-  if (latest_next_task_id != ctx->last_task_id) {
+  if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
     execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
@@ -164,6 +185,7 @@ static void handle_sched_switch(void* data, bool preempt,
     return;
   }
   const int cpu = get_cpu();
+  // FIXME: this does not always work; should be moved to client?
   WRITE_ONCE(shm[cpu].task_started_at, rdtsc());
   put_cpu();
 }
