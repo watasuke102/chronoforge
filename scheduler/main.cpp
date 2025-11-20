@@ -7,7 +7,6 @@
 #include <unistd.h>
 
 #include <algorithm>
-#include <bitset>
 #include <cassert>
 #include <cerrno>
 #include <cstdio>
@@ -23,6 +22,7 @@
 #define READ_ONCE(a)         (*(const volatile typeof(a)*)&(a))
 #define WRITE_ONCE(dst, val) ((*(volatile typeof(dst)*)&(dst)) = (val))
 
+// scheduling target that corresponding a client
 class Task {
  public:
   Task(pid_t id, int fd) : task_id_(id), socket_fd_(fd) {
@@ -42,15 +42,16 @@ class Task {
   int   socket_fd_;
 };
 
+// Context that shared between scheduling thread and socket thread
 struct Ctx {
   int                  kmodule_fd;
   int                  socket_fd;
   int                  epoll_fd;
   uint32_t             cycles_per_us;
   std::thread          socket_thread;
+  SharedContextPerCpu* shm;
   std::list<Task>      runqueue, running_tasks;
   std::mutex           runqueue_mutex;
-  SharedContextPerCpu* shm;
 };
 
 namespace {
@@ -63,6 +64,7 @@ uint64_t rdtsc() {
   return ((uint64_t)h << 32) | l;
 }
 
+// Poll incoming connections from clients
 void poll(Ctx* ctx) {
   int                ret;
   struct epoll_event ev;
@@ -94,7 +96,9 @@ void poll(Ctx* ctx) {
   }
 }
 
-void enqueue_execute_task(Ctx* ctx, int cpu) {
+/// Take a task from runqueue and request kmodule to execute the next task
+/// If there is no task in the runqueue, do nothing
+void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   if (ctx->runqueue.size() == 0) {
     return;
   }
@@ -108,6 +112,7 @@ void enqueue_execute_task(Ctx* ctx, int cpu) {
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
   std::printf("[debug] scheduled task %d on cpu %d\n", next_task_id, cpu);
 }
+/// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
   const pid_t task_id = READ_ONCE(ctx->shm[cpu].running_task_id);
   {
@@ -132,15 +137,19 @@ void schedule(Ctx* ctx) {
   const auto now = rdtsc();
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
     if (READ_ONCE(ctx->shm[i].is_busy)) {
+      // task is running; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
       std::printf("[debug] time slice for cpu %d (elapsed: %ld)\n", i,
           now - task_started_at);
+      // time slice exceeded
       if (now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
+        // request to park the task and schedule the next task
         enqueue_park_task(ctx, i);
-        enqueue_execute_task(ctx, i);
+        enqueue_execute_next_task(ctx, i);
       }
     } else if (ctx->runqueue.size() > 0) {
-      enqueue_execute_task(ctx, i);
+      // cpu is idle; schedule the next task
+      enqueue_execute_next_task(ctx, i);
     }
   }
   // dispatch enqueued requests
@@ -153,7 +162,7 @@ int main(void) {
   sockaddr_un addr;
   Ctx*        ctx = new Ctx();
 
-  {
+  {  // estimate CPU frequency
     timespec t_start, t_end;
     clock_gettime(CLOCK_MONOTONIC_RAW, &t_start);
     const auto start = rdtsc();
@@ -167,6 +176,7 @@ int main(void) {
     std::printf("[info] CPU frequency: %.2u cycles/us\n", ctx->cycles_per_us);
   }
 
+  // connect to kmodule
   ctx->kmodule_fd = open("/dev/kmodule", O_RDWR);
   if (ctx->kmodule_fd < 0) {
     std::printf("Failed to open /dev/kmodule (%s)\n", strerror(errno));
@@ -181,6 +191,7 @@ int main(void) {
   }
   std::memset(ctx->shm, 0, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
 
+  // create socket for clients
   std::memset(&addr, 0, sizeof(addr));
   addr.sun_family = AF_UNIX;
   std::memcpy(addr.sun_path, SOCKET_PATH, sizeof(SOCKET_PATH));
@@ -217,8 +228,8 @@ int main(void) {
     poll(ctx);
   });
 
+  // start scheduling
   std::puts("[info] Scheduler started");
-
   while (true) {
     schedule(ctx);
     std::this_thread::sleep_for(std::chrono::microseconds(10));

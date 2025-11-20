@@ -35,3 +35,13 @@ C/C++ compiler, make and cmake (>= 3.10) on Linux
 ## License
 
 Dual-licensed; [MIT](LICENSE-MIT) and [GPL-2.0](LICENSE-GPL)
+
+---
+
+## scheduling process
+
+1. A task is launched. Connect with Scheduler via UNIX socket and notify to Kmodule via `ioctl()`.
+   1. Scheduler adds the task to runqueue.
+2. Kmodule notifies to Scheduler that the CPU core becomes idle by writing shared memory.
+3. Scheduler picks a task from runqueue and requests Kmodule via `ioctl()` to execute it.
+4. Scheduler checks tasks that is runnning. If a task exceeds its time slice, Scheduler requests Kmodule via `ioctl()` to park it.
