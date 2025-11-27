@@ -1,8 +1,11 @@
 #pragma once
 
 #ifdef __cplusplus
+#include <sys/types.h>
+
 #include <cstdint>
 #else
+// kmodule
 #include <linux/types.h>
 #endif
 

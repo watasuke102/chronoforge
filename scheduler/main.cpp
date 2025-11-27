@@ -115,16 +115,16 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
   const pid_t task_id = READ_ONCE(ctx->shm[cpu].running_task_id);
+  auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
+      [task_id](const Task& t) {
+        return t.task_id() == task_id;
+      });
+  if (it == ctx->running_tasks.end()) {
+    std::printf("[error] failed to find task %d to park\n", task_id);
+    return;
+  }
   {
     std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
-    auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
-        [task_id](const Task& t) {
-          return t.task_id() == task_id;
-        });
-    if (it == ctx->running_tasks.end()) {
-      std::printf("[error] failed to find task %d to park\n", task_id);
-      return;
-    }
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
