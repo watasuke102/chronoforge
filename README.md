@@ -40,8 +40,10 @@ Dual-licensed; [MIT](LICENSE-MIT) and [GPL-2.0](LICENSE-GPL)
 
 ## scheduling process
 
-1. A task is launched. Connect with Scheduler via UNIX socket and notify to Kmodule via `ioctl()`.
-   1. Scheduler adds the task to runqueue.
-2. Kmodule notifies to Scheduler that the CPU core becomes idle by writing shared memory.
-3. Scheduler picks a task from runqueue and requests Kmodule via `ioctl()` to execute it.
-4. Scheduler checks tasks that is runnning. If a task exceeds its time slice, Scheduler requests Kmodule via `ioctl()` to park it.
+1. A task is launched. It connects with Scheduler via UNIX socket and send notification to Kmodule via `ioctl()`.
+   1. Scheduler accepts the connection, adds the task to the runqueue.
+   1. Kmodule handles ioctl(), makes the task INTERRUPTIBLE.
+2. When the CPU becomes idle, Kmodule checks the queue on the shared memory that is written by Scheduler. Now there is no requests, so Kmodule writes to shared memory to tell that the CPU becomes idle.
+3. Scheduler reads shm and aware that the CPU became idle. It picks a task from runqueue and enqueue the request to execute that task by writing to shm. Finally, it sends requests Kmodule via `ioctl()`.
+4. Kmodule handles ioctl(), awakes the task that is requested to execute.
+5. Scheduler checks tasks that is runnning. If a task exceeds its time slice, Scheduler requests Kmodule via `ioctl()` to park it.
