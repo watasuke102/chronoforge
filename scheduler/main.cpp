@@ -78,6 +78,7 @@ void poll(Ctx* ctx) {
       break;
     }
     if (ev.data.u32 != EPOLL_IDENTIFIER) {
+      std::printf("[error] unknown epoll event: %u\n", ev.data.u32);
       continue;
     }
     const int fd = accept(ctx->socket_fd, nullptr, nullptr);
@@ -110,7 +111,6 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
         ctx->running_tasks.end(), ctx->runqueue, ctx->runqueue.begin());
   }
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
-  std::printf("[debug] scheduled task %d on cpu %d\n", next_task_id, cpu);
 }
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
@@ -128,7 +128,6 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
-  std::printf("[debug] request park for task %d on cpu %d\n", task_id, cpu);
 }
 
 void schedule(Ctx* ctx) {
@@ -139,8 +138,6 @@ void schedule(Ctx* ctx) {
     if (READ_ONCE(ctx->shm[i].is_busy)) {
       // task is running; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
-      std::printf("[debug] time slice for cpu %d (elapsed: %ld)\n", i,
-          now - task_started_at);
       // time slice exceeded
       if (now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
         // request to park the task and schedule the next task

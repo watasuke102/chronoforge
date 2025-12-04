@@ -44,7 +44,7 @@ static void execute_task(
   WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].next_task_id, 0);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
-  printk(KERN_INFO "executed task (%d) on cpu %d\n", task_id, cpu_index);
+  printk(KERN_INFO "on cpu %d, executed task (%d)\n", cpu_index, task_id);
 }
 
 static void start_scheduling(void) {
