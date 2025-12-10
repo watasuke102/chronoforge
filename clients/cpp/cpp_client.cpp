@@ -19,7 +19,7 @@ int task(void* /*arg*/) {
       std::printf("[debug] waited: %d sec (real: %ld sec)\n", passed_sec,
           (t_now.tv_sec - t_start.tv_sec));
     }
-    std::this_thread::sleep_for(std::chrono::nanoseconds(100));
+    // std::this_thread::sleep_for(std::chrono::nanoseconds(100));
   }
   clock_gettime(CLOCK_MONOTONIC_RAW, &t_end);
 

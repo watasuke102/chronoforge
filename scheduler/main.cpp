@@ -64,6 +64,31 @@ uint64_t rdtsc() {
   return ((uint64_t)h << 32) | l;
 }
 
+void add_new_task(Ctx* ctx, int fd) {
+  ucred     optval;
+  socklen_t len = sizeof(optval);
+  if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &optval, &len) == -1) {
+    std::printf("Failed to get socket credentials (%s)\n", strerror(errno));
+    close(fd);
+    return;
+  }
+
+  struct epoll_event ev;
+  ev.events  = EPOLLIN;
+  ev.data.fd = fd;
+  if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
+    std::perror("[error] Failed to add socket to epoll");
+    close(fd);
+    return;
+  }
+
+  std::printf("[debug] new task: pid=%d\n", optval.pid);
+  {
+    std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
+    ctx->runqueue.emplace_back(optval.pid, fd);
+  }
+}
+
 // Poll incoming connections from clients
 void poll(Ctx* ctx) {
   int                ret;
@@ -77,22 +102,21 @@ void poll(Ctx* ctx) {
       std::perror("epoll_wait error");
       break;
     }
-    if (ev.data.u32 != EPOLL_IDENTIFIER) {
-      std::printf("[error] unknown epoll event: %u\n", ev.data.u32);
+    std::printf("[debug] epoll ev = %#x, data: %#x\n", ev.events, ev.data.u32);
+    if (ev.data.u32 == EPOLL_IDENTIFIER) {
+      const int fd = accept(ctx->socket_fd, nullptr, nullptr);
+      add_new_task(ctx, fd);
       continue;
     }
-    const int fd = accept(ctx->socket_fd, nullptr, nullptr);
-    ucred     optval;
-    socklen_t len = sizeof(optval);
-    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &optval, &len) == -1) {
-      std::printf("Failed to get socket credentials (%s)\n", strerror(errno));
-      close(fd);
+    if ((ev.events & EPOLLHUP) == 0) {
       continue;
     }
-    std::printf("[debug] new task: pid=%d\n", optval.pid);
-    {
-      std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
-      ctx->runqueue.emplace_back(optval.pid, fd);
+    // task finished
+    std::printf("[debug] task finished: fd=%d\n", ev.data.fd);
+    epoll_event ev_del;
+    ev_del.data.fd = ev.data.fd;
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, &ev_del) < 0) {
+      std::perror("[error] Failed to remove socket from epoll");
     }
   }
 }
@@ -214,10 +238,11 @@ int main(void) {
     goto close_socket;
   }
   struct epoll_event ev;
-  ev.events   = EPOLLIN | EPOLLERR;
+  ev.events   = EPOLLIN;
   ev.data.u32 = EPOLL_IDENTIFIER;
   if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->socket_fd, &ev) < 0) {
-    std::printf("Failed to add socket to epoll (%s)\n", strerror(errno));
+    std::printf(
+        "[error] Failed to add socket to epoll (%s)\n", strerror(errno));
     goto close_epoll_fd;
   }
 
