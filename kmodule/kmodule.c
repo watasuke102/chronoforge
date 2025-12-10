@@ -41,6 +41,7 @@ static void execute_task(
   wake_up_process(ctx->running_task);
   rcu_read_unlock();
 
+  ctx->last_task_id = task_id;
   WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].next_task_id, 0);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
@@ -71,7 +72,7 @@ static void process_ipi_from_scheduler(void) {
 
 static void park_task(void) {
   const int cpu = get_cpu();
-  WRITE_ONCE(shm[cpu].is_park_requested, true);
+  WRITE_ONCE(shm[cpu].is_park_requested, false);
   WRITE_ONCE(shm[cpu].is_busy, false);
   put_cpu();
 
@@ -123,13 +124,11 @@ static int handle_idle_enter(
   const int                  cpu = get_cpu();
   struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
 
-  WRITE_ONCE(shm[cpu].is_busy, false);
-
-  if (shm[cpu].next_task_id == 0) {
+  if (ctx->running_task) {
     put_cpu();
     return index;
   }
-  printk(KERN_INFO "next task: (%d)\n", shm[cpu].next_task_id);
+  WRITE_ONCE(shm[cpu].is_busy, false);
 
   // wait until the next task is requested (up to 8us)
   pid_t latest_next_task_id;
@@ -141,7 +140,13 @@ static int handle_idle_enter(
     udelay(1);
   }
 
+  if (latest_next_task_id == 0) {
+    put_cpu();
+    return index;
+  }
+
   if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
+    printk(KERN_INFO "next task: (%d)\n", latest_next_task_id);
     execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
