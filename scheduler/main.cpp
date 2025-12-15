@@ -36,6 +36,9 @@ class Task {
   pid_t task_id() const {
     return task_id_;
   }
+  int socket_fd() const {
+    return socket_fd_;
+  }
 
  private:
   pid_t task_id_;
@@ -50,8 +53,11 @@ struct Ctx {
   uint32_t             cycles_per_us;
   std::thread          socket_thread;
   SharedContextPerCpu* shm;
-  std::list<Task>      runqueue, running_tasks;
-  std::mutex           runqueue_mutex;
+
+  std::list<Task> runqueue;
+  std::list<Task> running_tasks;
+  std::mutex      runqueue_mutex;
+  std::mutex      running_tasks_mutex;
 };
 
 namespace {
@@ -113,6 +119,20 @@ void poll(Ctx* ctx) {
     }
     // task finished
     std::printf("[debug] task finished: fd=%d\n", ev.data.fd);
+    // task is expected to be in running_tasks
+    auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
+        [ev](const Task& t) {
+          return t.socket_fd() == ev.data.fd;
+        });
+    if (it == ctx->running_tasks.end()) {
+      // TODO: should I check runqueue as well?
+      std::printf(
+          "[error] failed to find finished task %d from running_tasks\n",
+          ev.data.fd);
+      continue;
+    }
+    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
+    ctx->running_tasks.erase(it);
     epoll_event ev_del;
     ev_del.data.fd = ev.data.fd;
     if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, &ev_del) < 0) {
@@ -129,7 +149,8 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   }
   pid_t next_task_id;
   {
-    std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
+    std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     next_task_id = ctx->runqueue.front().task_id();
     ctx->running_tasks.splice(
         ctx->running_tasks.end(), ctx->runqueue, ctx->runqueue.begin());
@@ -148,7 +169,8 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
     return;
   }
   {
-    std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
+    std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
