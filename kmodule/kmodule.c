@@ -12,19 +12,19 @@
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 
-struct LocalContextPerCpu {
+struct KmoduleContextPerCpu {
   pid_t last_task_id;
 
   // basically managed by execute_task()
   // but finally released by module_cleanup()
   struct task_struct* running_task;  // nullable
 };
-DEFINE_PER_CPU(struct LocalContextPerCpu, cpu_local_ctx);
+DEFINE_PER_CPU(struct KmoduleContextPerCpu, cpu_local_ctx);
 
 struct SharedContextPerCpu* shm;
 
 static void execute_task(
-    struct LocalContextPerCpu* ctx, pid_t task_id, int cpu_index) {
+    struct KmoduleContextPerCpu* ctx, pid_t task_id, int cpu_index) {
   if (ctx->running_task) {
     put_task_struct(ctx->running_task);
     ctx->running_task = NULL;
@@ -55,7 +55,7 @@ static void start_scheduling(void) {
 }
 
 static void process_ipi_from_scheduler(void) {
-  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
     if (ctx->running_task && READ_ONCE(shm[i].is_park_requested)) {
       send_sig(SIGUSR1, ctx->running_task, 0);
@@ -121,8 +121,8 @@ static struct file_operations ops = {
 
 static int handle_idle_enter(
     struct cpuidle_device* device, struct cpuidle_driver* driver, int index) {
-  const int                  cpu = get_cpu();
-  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  const int                    cpu = get_cpu();
+  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
 
   if (ctx->running_task) {
     put_cpu();
@@ -186,7 +186,7 @@ static void unhijack_cpuidle(void) {
 
 static void handle_sched_switch(void* data, bool preempt,
     struct task_struct* prev, struct task_struct* next) {
-  struct LocalContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   if (next != ctx->running_task) {
     return;
   }
@@ -257,7 +257,7 @@ static void module_cleanup(void) {
   unregist_sched_switch_tracepoint();
   int cpu;
   for_each_online_cpu(cpu) {
-    struct LocalContextPerCpu* p = per_cpu_ptr(&cpu_local_ctx, cpu);
+    struct KmoduleContextPerCpu* p = per_cpu_ptr(&cpu_local_ctx, cpu);
     if (p->running_task) {
       put_task_struct(p->running_task);
     }
