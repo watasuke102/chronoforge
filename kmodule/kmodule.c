@@ -37,6 +37,7 @@ static void execute_task(
     return;
   }
   ctx->running_task = pid_task(pid, PIDTYPE_PID);
+  set_cpus_allowed_ptr(ctx->running_task, cpumask_of(cpu_index));
   get_task_struct(ctx->running_task);
   wake_up_process(ctx->running_task);
   rcu_read_unlock();
@@ -45,7 +46,7 @@ static void execute_task(
   WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].next_task_id, 0);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
-  printk(KERN_INFO "on cpu %d, executed task (%d)\n", cpu_index, task_id);
+  printk(KERN_INFO "executed task %d at cpu %d\n", task_id, cpu_index);
 }
 
 static void start_scheduling(void) {
@@ -83,6 +84,7 @@ static void park_task(void) {
 
 static long module_ioctl(
     struct file* file, unsigned int cmd, unsigned long arg) {
+  printk(KERN_DEBUG "[ioctl] cmd=%u\n", cmd);
   switch (cmd) {
     case KMODULE_IOCTL_START:
       start_scheduling();
@@ -146,7 +148,7 @@ static int handle_idle_enter(
   }
 
   if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
-    printk(KERN_INFO "next task: (%d)\n", latest_next_task_id);
+    printk(KERN_INFO "[idle handler] next task: %d\n", latest_next_task_id);
     execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
