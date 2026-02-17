@@ -53,12 +53,16 @@ static void start_scheduling(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
+  printk(KERN_DEBUG "started; pid: %d, current cpu: %d\n", current->pid,
+      smp_processor_id());
 }
 
 static void process_ipi_from_scheduler(void) {
   struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
     if (ctx->running_task && READ_ONCE(shm[i].is_park_requested)) {
+      printk(KERN_DEBUG "[ipi] parking task %d on cpu %d\n",
+          ctx->running_task->pid, i);
       send_sig(SIGUSR1, ctx->running_task, 0);
       WRITE_ONCE(shm[i].is_park_requested, false);
       continue;

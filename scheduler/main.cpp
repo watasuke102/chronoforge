@@ -118,7 +118,6 @@ void poll(Ctx* ctx) {
       continue;
     }
     // task finished
-    std::printf("[debug] task finished: fd=%d\n", ev.data.fd);
     // task is expected to be in running_tasks
     auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
         [ev](const Task& t) {
@@ -127,10 +126,12 @@ void poll(Ctx* ctx) {
     if (it == ctx->running_tasks.end()) {
       // TODO: should I check runqueue as well?
       std::printf(
-          "[error] failed to find finished task %d from running_tasks\n",
+          "[error] Failed to find finished task %d from running_tasks\n",
           ev.data.fd);
       continue;
     }
+    std::printf("[debug] task finished: fd=%d, task_id=%d\n", ev.data.fd,
+        it->task_id());
     std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     ctx->running_tasks.erase(it);
     epoll_event ev_del;
@@ -147,6 +148,10 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   if (ctx->runqueue.size() == 0) {
     return;
   }
+  std::printf(
+      "[debug] enqueue_execute_next_task: next_task_id before renew on cpu %d: "
+      "%d\n",
+      cpu, READ_ONCE(ctx->shm[cpu].next_task_id));
   pid_t next_task_id;
   {
     std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
@@ -156,6 +161,7 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
         ctx->running_tasks.end(), ctx->runqueue, ctx->runqueue.begin());
   }
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
+  std::printf("[info] scheduled task %d at cpu %d\n", next_task_id, cpu);
 }
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
@@ -174,6 +180,7 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
+  std::printf("[info] parked task %d on cpu %d\n", task_id, cpu);
 }
 
 void schedule(Ctx* ctx) {
