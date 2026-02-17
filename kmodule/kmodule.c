@@ -56,6 +56,21 @@ static void start_scheduling(void) {
   printk(KERN_DEBUG "started; pid: %d, current cpu: %d\n", current->pid,
       smp_processor_id());
 }
+static void end_scheduling(void) {
+  const int                    cpu = get_cpu();
+  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  printk(KERN_INFO "task finished: cpu=%d, pid=%d, running_task: %p\n", cpu,
+      shm[cpu].running_task_id, ctx->running_task);
+  if (!ctx || !ctx->running_task) {
+    printk(KERN_WARNING "ctx or running_task is NULL\n");
+    put_cpu();
+    return;
+  }
+  put_task_struct(ctx->running_task);
+  ctx->running_task = NULL;
+  WRITE_ONCE(shm[cpu].running_task_id, 0);
+  put_cpu();
+}
 
 static void process_ipi_from_scheduler(void) {
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
@@ -68,8 +83,9 @@ static void process_ipi_from_scheduler(void) {
       continue;
     }
     pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
-    if (next_task_id != 0 && ctx->running_task &&
-        ctx->running_task->pid != next_task_id) {
+    if (next_task_id != 0 &&
+        (ctx->running_task == NULL || ctx->running_task->pid != next_task_id)) {
+      printk(KERN_DEBUG "[ipi] switching task %d on cpu %d\n", next_task_id, i);
       execute_task(ctx, next_task_id, i);
     }
   }
@@ -92,6 +108,9 @@ static long module_ioctl(
   switch (cmd) {
     case KMODULE_IOCTL_START:
       start_scheduling();
+      break;
+    case KMODULE_IOCTL_END:
+      end_scheduling();
       break;
     case KMODULE_IOCTL_INTR:
       process_ipi_from_scheduler();

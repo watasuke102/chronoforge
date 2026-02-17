@@ -9,9 +9,12 @@
 #include <linux/types.h>
 #endif
 
+// sent from runtime
 #define KMODULE_IOCTL_START 0
-#define KMODULE_IOCTL_INTR  1
-#define KMODULE_IOCTL_PARK  2
+#define KMODULE_IOCTL_END   1
+// sent from scheduler
+#define KMODULE_IOCTL_INTR  2
+#define KMODULE_IOCTL_PARK  3
 
 struct SharedContextPerCpu {
   bool     is_busy;

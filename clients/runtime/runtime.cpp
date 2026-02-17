@@ -67,6 +67,8 @@ extern "C" int runtime_start(int (*entrypoint)(void*), void* arg) {
   // start client task
   const int ret = entrypoint(arg);
 
+  ioctl(kmodule_fd, KMODULE_IOCTL_END);
+
   if (kmodule_fd >= 0) {
     close(kmodule_fd);
   }
