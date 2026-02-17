@@ -58,8 +58,8 @@ static void start_scheduling(void) {
 }
 
 static void process_ipi_from_scheduler(void) {
-  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
+    struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, i);
     if (ctx->running_task && READ_ONCE(shm[i].is_park_requested)) {
       printk(KERN_DEBUG "[ipi] parking task %d on cpu %d\n",
           ctx->running_task->pid, i);
