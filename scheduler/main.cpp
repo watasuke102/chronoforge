@@ -111,6 +111,10 @@ void poll(Ctx* ctx) {
     std::printf("[debug] epoll ev = %#x, data: %#x\n", ev.events, ev.data.u32);
     if (ev.data.u32 == EPOLL_IDENTIFIER) {
       const int fd = accept(ctx->socket_fd, nullptr, nullptr);
+      if (fd < 0) {
+        std::perror("Failed to accept connection");
+        continue;
+      }
       add_new_task(ctx, fd);
       continue;
     }
@@ -134,11 +138,10 @@ void poll(Ctx* ctx) {
         it->task_id());
     std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     ctx->running_tasks.erase(it);
-    epoll_event ev_del;
-    ev_del.data.fd = ev.data.fd;
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, &ev_del) < 0) {
+    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, nullptr) < 0) {
       std::perror("[error] Failed to remove socket from epoll");
     }
+    close(ev.data.fd);
   }
 }
 
