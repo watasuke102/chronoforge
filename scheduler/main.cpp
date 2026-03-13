@@ -123,6 +123,7 @@ void poll(Ctx* ctx) {
     }
     // task finished
     // task is expected to be in running_tasks
+    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
         [ev](const Task& t) {
           return t.socket_fd() == ev.data.fd;
@@ -136,7 +137,6 @@ void poll(Ctx* ctx) {
     }
     std::printf("[debug] task finished: fd=%d, task_id=%d\n", ev.data.fd,
         it->task_id());
-    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     ctx->running_tasks.erase(it);
     if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, nullptr) < 0) {
       std::perror("[error] Failed to remove socket from epoll");
@@ -148,6 +148,7 @@ void poll(Ctx* ctx) {
 /// Take a task from runqueue and request kmodule to execute the next task
 /// If there is no task in the runqueue, do nothing
 void enqueue_execute_next_task(Ctx* ctx, int cpu) {
+  std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
   if (ctx->runqueue.size() == 0) {
     return;
   }
@@ -157,7 +158,6 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
       cpu, READ_ONCE(ctx->shm[cpu].next_task_id));
   pid_t next_task_id;
   {
-    std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
     std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     next_task_id = ctx->runqueue.front().task_id();
     ctx->running_tasks.splice(
@@ -169,6 +169,7 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
   const pid_t task_id = READ_ONCE(ctx->shm[cpu].running_task_id);
+  std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
   auto it = std::find_if(ctx->running_tasks.begin(), ctx->running_tasks.end(),
       [task_id](const Task& t) {
         return t.task_id() == task_id;
@@ -179,7 +180,6 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
   }
   {
     std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
@@ -191,16 +191,22 @@ void schedule(Ctx* ctx) {
 
   const auto now = rdtsc();
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
+    uint32_t runqueue_size = 0;
+    {
+      std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+      runqueue_size = ctx->runqueue.size();
+    }
     if (READ_ONCE(ctx->shm[i].is_busy)) {
       // task is running; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
       // time slice exceeded
-      if (now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
+      if (runqueue_size > 0 &&
+          now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
         // request to park the task and schedule the next task
         enqueue_park_task(ctx, i);
         enqueue_execute_next_task(ctx, i);
       }
-    } else if (ctx->runqueue.size() > 0) {
+    } else if (runqueue_size > 0) {
       // cpu is idle; schedule the next task
       enqueue_execute_next_task(ctx, i);
     }
