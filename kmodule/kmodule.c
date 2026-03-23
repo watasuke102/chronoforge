@@ -73,20 +73,22 @@ static void end_scheduling(void) {
 }
 
 static void process_ipi_from_scheduler(void) {
-  for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
-    struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, i);
-    if (ctx->running_task && READ_ONCE(shm[i].is_park_requested)) {
+  int cpu = 0;
+  for_each_online_cpu(cpu) {
+    struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
+    if (ctx->running_task && READ_ONCE(shm[cpu].is_park_requested)) {
       printk(KERN_DEBUG "[ipi] parking task %d on cpu %d\n",
-          ctx->running_task->pid, i);
+          ctx->running_task->pid, cpu);
       send_sig(SIGUSR1, ctx->running_task, 0);
-      WRITE_ONCE(shm[i].is_park_requested, false);
+      WRITE_ONCE(shm[cpu].is_park_requested, false);
       continue;
     }
-    pid_t next_task_id = READ_ONCE(shm[i].next_task_id);
+    pid_t next_task_id = READ_ONCE(shm[cpu].next_task_id);
     if (next_task_id != 0 &&
         (ctx->running_task == NULL || ctx->running_task->pid != next_task_id)) {
-      printk(KERN_DEBUG "[ipi] switching task %d on cpu %d\n", next_task_id, i);
-      execute_task(ctx, next_task_id, i);
+      printk(
+          KERN_DEBUG "[ipi] switching task %d on cpu %d\n", next_task_id, cpu);
+      execute_task(ctx, next_task_id, cpu);
     }
   }
 }

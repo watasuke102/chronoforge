@@ -7,13 +7,18 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <bitset>
 #include <cassert>
+#include <cctype>
 #include <cerrno>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <list>
 #include <mutex>
+#include <sstream>
+#include <string>
 #include <thread>
 
 #include "kmodule.h"
@@ -61,8 +66,8 @@ struct Ctx {
 };
 
 namespace {
-constexpr uint32_t EPOLL_IDENTIFIER = 0x02c0'ffee;
-constexpr uint64_t MAX_CPU          = 256;
+constexpr uint32_t                 EPOLL_IDENTIFIER = 0x02c0'ffee;
+std::bitset<KMODULE_SHM_ARRAY_LEN> active_cpus;
 
 uint64_t rdtsc() {
   uint32_t l, h;
@@ -191,6 +196,9 @@ void schedule(Ctx* ctx) {
 
   const auto now = rdtsc();
   for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
+    if (!active_cpus.test(i)) {
+      continue;
+    }
     uint32_t runqueue_size = 0;
     {
       std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
@@ -275,6 +283,107 @@ int main(void) {
     std::printf("Failed to create epoll instance (%s)\n", strerror(errno));
     goto close_socket;
   }
+
+  {
+    // onine list (e.g. "0-3,8")
+    std::ifstream online_cpu_file("/sys/devices/system/cpu/online");
+    if (!online_cpu_file) {
+      std::printf("[error] Failed to open /sys/devices/system/cpu/online\n");
+      goto close_epoll_fd;
+    }
+
+    std::string online_cpu_list;
+    if (!std::getline(online_cpu_file, online_cpu_list)) {
+      std::printf("[error] Failed to read /sys/devices/system/cpu/online\n");
+      goto close_epoll_fd;
+    }
+
+    std::stringstream cpu_tokens(online_cpu_list);
+    std::string       token;
+    active_cpus.reset();
+    const auto parse_uint64_strict = [](const std::string& s,
+                                         uint64_t*         out) -> bool {
+      if (s.empty()) {
+        return false;
+      }
+      size_t pos = 0;
+      try {
+        const uint64_t v = std::stoull(s, &pos, 10);
+        if (pos != s.size()) {
+          return false;
+        }
+        *out = v;
+        return true;
+      } catch (...) {
+        return false;
+      }
+    };
+
+    while (std::getline(cpu_tokens, token, ',')) {
+      token.erase(std::remove_if(token.begin(), token.end(),
+                      [](unsigned char c) {
+                        return std::isspace(c) != 0;
+                      }),
+          token.end());
+      if (token.empty()) {
+        continue;
+      }
+
+      const auto dash_pos  = token.find('-');
+      uint64_t   first_cpu = 0;
+      uint64_t   last_cpu  = 0;
+      const bool has_range = (dash_pos != std::string::npos);
+      if (!has_range) {
+        if (!parse_uint64_strict(token, &first_cpu)) {
+          std::printf("[error] Failed to parse cpu list: %s\n",
+              online_cpu_list.c_str());
+          goto close_epoll_fd;
+        }
+        last_cpu = first_cpu;
+      } else {
+        const auto invalid_extra_dash = token.find('-', dash_pos + 1);
+        if (invalid_extra_dash != std::string::npos || dash_pos == 0 ||
+            dash_pos + 1 >= token.size()) {
+          std::printf("[error] Failed to parse cpu list: %s\n",
+              online_cpu_list.c_str());
+          goto close_epoll_fd;
+        }
+        const std::string first_str = token.substr(0, dash_pos);
+        const std::string last_str  = token.substr(dash_pos + 1);
+        if (!parse_uint64_strict(first_str, &first_cpu) ||
+            !parse_uint64_strict(last_str, &last_cpu)) {
+          std::printf("[error] Failed to parse cpu list: %s\n",
+              online_cpu_list.c_str());
+          goto close_epoll_fd;
+        }
+        if (last_cpu < first_cpu) {
+          std::printf("[error] Failed to parse cpu range: %s\n",
+              online_cpu_list.c_str());
+          goto close_epoll_fd;
+        }
+      }
+
+      if (last_cpu >= KMODULE_SHM_ARRAY_LEN) {
+        std::printf("[error] cpu index out of range: %llu (max=%d)\n",
+            static_cast<unsigned long long>(last_cpu),
+            KMODULE_SHM_ARRAY_LEN - 1);
+        goto close_epoll_fd;
+      }
+      for (uint64_t cpu = first_cpu; cpu <= last_cpu; ++cpu) {
+        active_cpus.set(static_cast<size_t>(cpu));
+      }
+    }
+
+    if (active_cpus.none()) {
+      std::printf(
+          "[error] No online cpu found in /sys/devices/system/cpu/online\n");
+      goto close_epoll_fd;
+    }
+
+    std::printf("[info] active cpu bitmask=%s (total: %lu)\n",
+        active_cpus.to_string().c_str(), active_cpus.count());
+  }
+
   struct epoll_event ev;
   ev.events   = EPOLLIN;
   ev.data.u32 = EPOLL_IDENTIFIER;
@@ -302,7 +411,7 @@ close_epoll_fd:
 close_socket:
   close(ctx->socket_fd);
 munmap_shm:
-  munmap(ctx->shm, sizeof(SharedContextPerCpu) * 64);
+  munmap(ctx->shm, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
 close_kmodule_fd:
   close(ctx->kmodule_fd);
 delete_ctx:
