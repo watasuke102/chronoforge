@@ -29,6 +29,7 @@ static void execute_task(
     put_task_struct(ctx->running_task);
     ctx->running_task = NULL;
   }
+
   rcu_read_lock();
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
@@ -36,7 +37,19 @@ static void execute_task(
     rcu_read_unlock();
     return;
   }
-  ctx->running_task = pid_task(pid, PIDTYPE_PID);
+  struct task_struct* next = pid_task(pid, PIDTYPE_PID);
+  // Failed to find the task or task is already running
+  if (!next || next->on_cpu || next->__state == TASK_WAKING ||
+      next->__state == TASK_RUNNING) {
+    if (next) {
+      printk(KERN_WARNING "pid %d is running (on_cpu: %d, __state: %d)",
+          task_id, next->on_cpu, next->__state);
+    }
+    rcu_read_unlock();
+    return;
+  }
+
+  ctx->running_task = next;
   set_cpus_allowed_ptr(ctx->running_task, cpumask_of(cpu_index));
   get_task_struct(ctx->running_task);
   wake_up_process(ctx->running_task);
