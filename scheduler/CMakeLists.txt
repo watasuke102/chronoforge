@@ -6,7 +6,7 @@ set(CMAKE_COLOR_DIAGNOSTICS ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 add_executable(${CMAKE_PROJECT_NAME}
-  main.cpp
+  scheduler.cpp
 )
 
 target_include_directories(${CMAKE_PROJECT_NAME}
