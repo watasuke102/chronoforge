@@ -10,11 +10,12 @@
 #endif
 
 // sent from runtime
-#define KMODULE_IOCTL_START 0
-#define KMODULE_IOCTL_END   1
+#define KMODULE_IOCTL_MAGIC 'C'  // Chronoforge
+#define KMODULE_IOCTL_START _IO(KMODULE_IOCTL_MAGIC, 0)
+#define KMODULE_IOCTL_END   _IO(KMODULE_IOCTL_MAGIC, 1)
 // sent from scheduler
-#define KMODULE_IOCTL_INTR  2
-#define KMODULE_IOCTL_PARK  3
+#define KMODULE_IOCTL_INTR  _IO(KMODULE_IOCTL_MAGIC, 2)
+#define KMODULE_IOCTL_PARK  _IO(KMODULE_IOCTL_MAGIC, 3)
 
 struct SharedContextPerCpu {
   bool     is_busy;

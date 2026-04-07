@@ -119,7 +119,6 @@ static void park_task(void) {
 
 static long module_ioctl(
     struct file* file, unsigned int cmd, unsigned long arg) {
-  printk(KERN_DEBUG "[ioctl] cmd=%u\n", cmd);
   switch (cmd) {
     case KMODULE_IOCTL_START:
       start_scheduling();

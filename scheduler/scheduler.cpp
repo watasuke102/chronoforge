@@ -1,3 +1,5 @@
+#include "scheduler.h"
+
 #include <fcntl.h>
 #include <sys/epoll.h>
 #include <sys/ioctl.h>
@@ -22,7 +24,6 @@
 #include <thread>
 
 #include "kmodule.h"
-#include "scheduler.h"
 
 #define READ_ONCE(a)         (*(const volatile typeof(a)*)&(a))
 #define WRITE_ONCE(dst, val) ((*(volatile typeof(dst)*)&(dst)) = (val))
