@@ -34,6 +34,7 @@ static void execute_task(
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
     printk(KERN_WARNING "failed to find pid (%d)\n", task_id);
+    WRITE_ONCE(shm[cpu_index].next_task_id, 0);
     rcu_read_unlock();
     return;
   }
