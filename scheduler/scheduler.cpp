@@ -9,6 +9,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <array>
 #include <bitset>
 #include <cassert>
 #include <cctype>
@@ -19,6 +20,7 @@
 #include <fstream>
 #include <list>
 #include <mutex>
+#include <optional>
 #include <sstream>
 #include <string>
 #include <thread>
@@ -32,6 +34,26 @@
 class Task {
  public:
   Task(pid_t id, int fd) : task_id_(id), socket_fd_(fd) {
+  }
+  Task(const Task&)            = delete;
+  Task& operator=(const Task&) = delete;
+  Task(Task&& other) noexcept
+      : task_id_(other.task_id_), socket_fd_(other.socket_fd_) {
+    other.task_id_   = 0;
+    other.socket_fd_ = 0;
+  }
+  Task& operator=(Task&& other) noexcept {
+    if (this == &other) {
+      return *this;
+    }
+    if (socket_fd_ != 0) {
+      close(socket_fd_);
+    }
+    task_id_         = other.task_id_;
+    socket_fd_       = other.socket_fd_;
+    other.task_id_   = 0;
+    other.socket_fd_ = 0;
+    return *this;
   }
   ~Task() {
     if (socket_fd_ != 0) {
@@ -60,10 +82,12 @@ struct Ctx {
   std::thread          socket_thread;
   SharedContextPerCpu* shm;
 
-  std::list<Task> runqueue;
-  std::list<Task> running_tasks;
-  std::mutex      runqueue_mutex;
-  std::mutex      running_tasks_mutex;
+  std::list<Task>                                        runqueue;
+  std::list<Task>                                        running_tasks;
+  std::array<std::optional<Task>, KMODULE_SHM_ARRAY_LEN> pending_task_per_cpu;
+  std::mutex                                             runqueue_mutex;
+  std::mutex                                             running_tasks_mutex;
+  std::mutex                                             pending_tasks_mutex;
 };
 
 namespace {
@@ -135,10 +159,26 @@ void poll(Ctx* ctx) {
           return t.socket_fd() == ev.data.fd;
         });
     if (it == ctx->running_tasks.end()) {
+      std::lock_guard<std::mutex> rqm(ctx->runqueue_mutex);
+      std::lock_guard<std::mutex> pm(ctx->pending_tasks_mutex);
       // TODO: should I check runqueue as well?
       std::printf(
           "[error] Failed to find finished task %d from running_tasks\n",
           ev.data.fd);
+      auto rq_task = std::find_if(
+          ctx->runqueue.begin(), ctx->runqueue.end(), [ev](const Task& t) {
+            return t.socket_fd() == ev.data.fd;
+          });
+      if (rq_task != ctx->runqueue.end()) {
+        std::printf(">>> task %ld is on runqueue\n", ev.data.u64);
+      }
+      auto pending_task = std::find_if(ctx->pending_task_per_cpu.begin(),
+          ctx->pending_task_per_cpu.end(), [ev](const std::optional<Task>& t) {
+            return t.has_value() && t->socket_fd() == ev.data.fd;
+          });
+      if (pending_task != ctx->pending_task_per_cpu.end()) {
+        std::printf(">>> task %ld is on pending\n", ev.data.u64);
+      }
       continue;
     }
     std::printf("[debug] task finished: fd=%d, task_id=%d\n", ev.data.fd,
@@ -154,23 +194,87 @@ void poll(Ctx* ctx) {
 /// Take a task from runqueue and request kmodule to execute the next task
 /// If there is no task in the runqueue, do nothing
 void enqueue_execute_next_task(Ctx* ctx, int cpu) {
+  std::lock_guard<std::mutex> lock_pending(ctx->pending_tasks_mutex);
+  auto&                       pending = ctx->pending_task_per_cpu[cpu];
+  if (pending.has_value()) {
+    return;
+  }
+
   std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-  if (ctx->runqueue.size() == 0) {
+  if (ctx->runqueue.empty()) {
     return;
   }
   std::printf(
       "[debug] enqueue_execute_next_task: next_task_id before renew on cpu %d: "
       "%d\n",
       cpu, READ_ONCE(ctx->shm[cpu].next_task_id));
-  pid_t next_task_id;
-  {
-    std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
-    next_task_id = ctx->runqueue.front().task_id();
-    ctx->running_tasks.splice(
-        ctx->running_tasks.end(), ctx->runqueue, ctx->runqueue.begin());
-  }
+  const pid_t next_task_id = ctx->runqueue.front().task_id();
+  pending.emplace(std::move(ctx->runqueue.front()));
+  ctx->runqueue.pop_front();
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
-  std::printf("[info] scheduled task %d at cpu %d\n", next_task_id, cpu);
+  std::printf("[info] enqueued task %d at cpu %d\n", next_task_id, cpu);
+}
+
+void finalize_enqueued_task(Ctx* ctx, int cpu) {
+  std::lock_guard<std::mutex> lock_pending(ctx->pending_tasks_mutex);
+  auto&                       pending = ctx->pending_task_per_cpu[cpu];
+  if (!pending.has_value()) {
+    return;
+  }
+
+  const pid_t requested_task_id = pending->task_id();
+  const int   requested_fd      = pending->socket_fd();
+  const pid_t next_task_id      = READ_ONCE(ctx->shm[cpu].next_task_id);
+  const pid_t running_task_id   = READ_ONCE(ctx->shm[cpu].running_task_id);
+
+  // execution request was confirmed
+  if (next_task_id == 0) {
+    if (running_task_id == requested_task_id) {
+      // the task was successfully executed
+      std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
+      ctx->running_tasks.emplace_back(std::move(*pending));
+      pending.reset();
+      std::printf("[info] execution confirmed: task %d on cpu %d\n",
+          requested_task_id, cpu);
+    } else {
+      // kmodule could not find the target PID, so discard it
+      pending.reset();
+      if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, requested_fd, nullptr) < 0 &&
+          errno != ENOENT && errno != EBADF) {
+        std::perror("[error] Failed to remove discarded task from epoll");
+      }
+      std::printf(
+          "[warn] discarded task %d on cpu %d because PID was not found\n",
+          requested_task_id, cpu);
+    }
+    // always stop finalization when next_task_id was cleared
+    return;
+  }
+
+  if (next_task_id == requested_task_id) {
+    // kmodule kept next_task_id unchanged, so execution failed for a reason
+    // other than missing PID. Return the task to runqueue and retry later
+    WRITE_ONCE(ctx->shm[cpu].next_task_id, 0);
+    {
+      std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+      ctx->runqueue.emplace_back(std::move(*pending));
+    }
+    pending.reset();
+    std::printf("[warn] execution failed for task %d on cpu %d; requeued\n",
+        requested_task_id, cpu);
+    return;
+  }
+
+  // Unexpected failure; requeue the task
+  {
+    std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+    ctx->runqueue.emplace_back(std::move(*pending));
+  }
+  pending.reset();
+  std::printf(
+      "[warn] inconsistent pending state on cpu %d (pending=%d, next=%d); "
+      "requeued\n",
+      cpu, requested_task_id, next_task_id);
 }
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
@@ -205,7 +309,7 @@ void schedule(Ctx* ctx) {
       std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
       runqueue_size = ctx->runqueue.size();
     }
-    if (READ_ONCE(ctx->shm[i].is_busy)) {
+    if (READ_ONCE(ctx->shm[i].running_task_id) != 0) {
       // task is running; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
       // time slice exceeded
@@ -222,6 +326,14 @@ void schedule(Ctx* ctx) {
   }
   // dispatch enqueued requests
   ioctl(ctx->kmodule_fd, KMODULE_IOCTL_INTR);
+
+  // Move tasks from pending state based on kmodule execution result.
+  for (int i = 0; i < KMODULE_SHM_ARRAY_LEN; i++) {
+    if (!active_cpus.test(i)) {
+      continue;
+    }
+    finalize_enqueued_task(ctx, i);
+  }
 }
 }  // namespace
 
