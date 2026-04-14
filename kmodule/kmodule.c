@@ -8,12 +8,14 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/printk.h>
+#include <linux/spinlock.h>
 #include <linux/tracepoint.h>
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 
 struct KmoduleContextPerCpu {
-  pid_t last_task_id;
+  pid_t      last_task_id;
+  spinlock_t execute_task_lock;
 
   // basically managed by execute_task()
   // but finally released by module_cleanup()
@@ -25,6 +27,9 @@ struct SharedContextPerCpu* shm;
 
 static void execute_task(
     struct KmoduleContextPerCpu* ctx, pid_t task_id, int cpu_index) {
+  unsigned long flags;
+  spin_lock_irqsave(&ctx->execute_task_lock, flags);
+
   if (ctx->running_task) {
     put_task_struct(ctx->running_task);
     ctx->running_task = NULL;
@@ -34,8 +39,8 @@ static void execute_task(
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
     printk(KERN_WARNING "failed to find pid (%d)\n", task_id);
-    WRITE_ONCE(shm[cpu_index].next_task_id, 0);
     rcu_read_unlock();
+    spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
     return;
   }
   struct task_struct* next = pid_task(pid, PIDTYPE_PID);
@@ -47,6 +52,7 @@ static void execute_task(
           task_id, next->on_cpu, next->__state);
     }
     rcu_read_unlock();
+    spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
     return;
   }
 
@@ -58,9 +64,9 @@ static void execute_task(
 
   ctx->last_task_id = task_id;
   WRITE_ONCE(shm[cpu_index].is_busy, true);
-  WRITE_ONCE(shm[cpu_index].next_task_id, 0);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
   printk(KERN_INFO "executed task %d at cpu %d\n", task_id, cpu_index);
+  spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
 }
 
 static void start_scheduling(void) {
@@ -93,6 +99,7 @@ static void process_ipi_from_scheduler(void) {
     if (ctx->running_task && READ_ONCE(shm[cpu].is_park_requested)) {
       printk(KERN_DEBUG "[ipi] parking task %d on cpu %d\n",
           ctx->running_task->pid, cpu);
+      // just send signal, actual park request is sent from runtime via ioctl()
       send_sig(SIGUSR1, ctx->running_task, 0);
       WRITE_ONCE(shm[cpu].is_park_requested, false);
       continue;
@@ -100,6 +107,9 @@ static void process_ipi_from_scheduler(void) {
     pid_t next_task_id = READ_ONCE(shm[cpu].next_task_id);
     if (next_task_id != 0 &&
         (ctx->running_task == NULL || ctx->running_task->pid != next_task_id)) {
+      if (cmpxchg(&shm[cpu].next_task_id, next_task_id, 0) != next_task_id) {
+        continue;
+      }
       printk(
           KERN_DEBUG "[ipi] switching task %d on cpu %d\n", next_task_id, cpu);
       execute_task(ctx, next_task_id, cpu);
@@ -111,6 +121,7 @@ static void park_task(void) {
   const int cpu = get_cpu();
   WRITE_ONCE(shm[cpu].is_park_requested, false);
   WRITE_ONCE(shm[cpu].is_busy, false);
+  WRITE_ONCE(shm[cpu].running_task_id, 0);
   put_cpu();
 
   __set_current_state(TASK_INTERRUPTIBLE);
@@ -186,6 +197,11 @@ static int handle_idle_enter(
   }
 
   if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
+    if (cmpxchg(&shm[cpu].next_task_id, latest_next_task_id, 0) !=
+        latest_next_task_id) {
+      put_cpu();
+      return index;
+    }
     printk(KERN_INFO "[idle handler] next task: %d\n", latest_next_task_id);
     execute_task(ctx, latest_next_task_id, cpu);
   }
@@ -281,6 +297,14 @@ static int         module_entry(void) {
   if (hijack_cpuidle() != 0) {
     printk(KERN_ERR "Failed to hijack cpuidle\n");
     return -1;
+  }
+
+  {
+    int cpu;
+    for_each_online_cpu(cpu) {
+      struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
+      spin_lock_init(&ctx->execute_task_lock);
+    }
   }
 
   regist_sched_switch_tracepoint();
