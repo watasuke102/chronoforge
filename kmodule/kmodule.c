@@ -13,6 +13,11 @@
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 
+#define LOG_ERROR(fmt, ...) printk(KERN_ERR "[error] " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  printk(KERN_WARNING "[warn ] " fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  printk(KERN_INFO "[info ] " fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) printk(KERN_DEBUG "[debug] " fmt, ##__VA_ARGS__)
+
 struct KmoduleContextPerCpu {
   pid_t      last_task_id;
   spinlock_t execute_task_lock;
@@ -38,7 +43,7 @@ static void execute_task(
   rcu_read_lock();
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
-    printk(KERN_WARNING "failed to find pid (%d)\n", task_id);
+    LOG_WARN("failed to find pid (%d)\n", task_id);
     rcu_read_unlock();
     spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
     return;
@@ -48,8 +53,8 @@ static void execute_task(
   if (!next || next->on_cpu || next->__state == TASK_WAKING ||
       next->__state == TASK_RUNNING) {
     if (next) {
-      printk(KERN_WARNING "pid %d is running (on_cpu: %d, __state: %d)",
-          task_id, next->on_cpu, next->__state);
+      LOG_WARN("pid %d is running (on_cpu: %d, __state: %d)", task_id,
+          next->on_cpu, next->__state);
     }
     rcu_read_unlock();
     spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
@@ -65,7 +70,7 @@ static void execute_task(
   ctx->last_task_id = task_id;
   WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
-  printk(KERN_INFO "executed task %d at cpu %d\n", task_id, cpu_index);
+  LOG_INFO("executed task %d at cpu %d\n", task_id, cpu_index);
   spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
 }
 
@@ -73,16 +78,16 @@ static void start_scheduling(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
-  printk(KERN_DEBUG "started; pid: %d, current cpu: %d\n", current->pid,
-      smp_processor_id());
+  LOG_DEBUG(
+      "started; pid: %d, current cpu: %d\n", current->pid, smp_processor_id());
 }
 static void end_scheduling(void) {
   const int                    cpu = get_cpu();
   struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
-  printk(KERN_INFO "task finished: cpu=%d, pid=%d, running_task: %p\n", cpu,
+  LOG_INFO("task finished: cpu=%d, pid=%d, running_task: %p\n", cpu,
       shm[cpu].running_task_id, ctx->running_task);
   if (!ctx || !ctx->running_task) {
-    printk(KERN_WARNING "ctx or running_task is NULL\n");
+    LOG_WARN("ctx or running_task is NULL\n");
     put_cpu();
     return;
   }
@@ -97,8 +102,8 @@ static void process_ipi_from_scheduler(void) {
   for_each_online_cpu(cpu) {
     struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
     if (ctx->running_task && READ_ONCE(shm[cpu].is_park_requested)) {
-      printk(KERN_DEBUG "[ipi] parking task %d on cpu %d\n",
-          ctx->running_task->pid, cpu);
+      LOG_DEBUG(
+          "(ipi) parking task %d on cpu %d\n", ctx->running_task->pid, cpu);
       // just send signal, actual park request is sent from runtime via ioctl()
       send_sig(SIGUSR1, ctx->running_task, 0);
       WRITE_ONCE(shm[cpu].is_park_requested, false);
@@ -110,8 +115,7 @@ static void process_ipi_from_scheduler(void) {
       if (cmpxchg(&shm[cpu].next_task_id, next_task_id, 0) != next_task_id) {
         continue;
       }
-      printk(
-          KERN_DEBUG "[ipi] switching task %d on cpu %d\n", next_task_id, cpu);
+      LOG_DEBUG("(ipi) switching task %d on cpu %d\n", next_task_id, cpu);
       execute_task(ctx, next_task_id, cpu);
     }
   }
@@ -202,7 +206,7 @@ static int handle_idle_enter(
       put_cpu();
       return index;
     }
-    printk(KERN_INFO "[idle handler] next task: %d\n", latest_next_task_id);
+    LOG_INFO("(idle handler) next task: %d\n", latest_next_task_id);
     execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
@@ -276,26 +280,26 @@ static int         module_entry(void) {
   dev_t devno;
   int   ret = alloc_chrdev_region(&devno, 0, 1, "kmodule");
   if (ret) {
-    printk(KERN_ERR "Failed to register character device region (%d)\n", ret);
+    LOG_ERROR("Failed to register character device region (%d)\n", ret);
     return -1;
   }
   cdev_init(&cdev, &ops);
   ret = cdev_add(&cdev, devno, 1);
   if (ret) {
-    printk(KERN_ERR "Failed to add character device (%d)\n", ret);
+    LOG_ERROR("Failed to add character device (%d)\n", ret);
     return -1;
   }
 
   shm =
       vmalloc_user(sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
   if (!shm) {
-    printk(KERN_ERR "Failed to allocate shared memory\n");
+    LOG_ERROR("Failed to allocate shared memory\n");
     return -ENOMEM;
   }
   memset(shm, 0, sizeof(struct SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
 
   if (hijack_cpuidle() != 0) {
-    printk(KERN_ERR "Failed to hijack cpuidle\n");
+    LOG_ERROR("Failed to hijack cpuidle\n");
     return -1;
   }
 
@@ -309,7 +313,7 @@ static int         module_entry(void) {
 
   regist_sched_switch_tracepoint();
 
-  printk(KERN_INFO "Module initialized successfully\n");
+  LOG_INFO("Module initialized successfully\n");
   return 0;
 }
 static void module_cleanup(void) {
@@ -327,7 +331,7 @@ static void module_cleanup(void) {
     }
   }
   unhijack_cpuidle();
-  printk(KERN_INFO "Module exited successfully\n");
+  LOG_INFO("Module exited successfully\n");
 }
 
 module_init(module_entry);

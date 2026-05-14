@@ -30,6 +30,11 @@
 #define READ_ONCE(a)         (*(const volatile typeof(a)*)&(a))
 #define WRITE_ONCE(dst, val) ((*(volatile typeof(dst)*)&(dst)) = (val))
 
+#define LOG_ERROR(fmt, ...) printf("\033[31m[error]\033[0m " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  printf("\033[33m[warn ]\033[0m " fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  printf("\033[32m[info ]\033[0m " fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) printf("\033[34m[debug]\033[0m " fmt, ##__VA_ARGS__)
+
 // scheduling target that corresponding a client
 class Task {
  public:
@@ -104,7 +109,7 @@ void add_new_task(Ctx* ctx, int fd) {
   ucred     optval;
   socklen_t len = sizeof(optval);
   if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &optval, &len) == -1) {
-    std::printf("Failed to get socket credentials (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to get socket credentials (%s)\n", strerror(errno));
     close(fd);
     return;
   }
@@ -113,12 +118,12 @@ void add_new_task(Ctx* ctx, int fd) {
   ev.events  = EPOLLIN;
   ev.data.fd = fd;
   if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
-    std::perror("[error] Failed to add socket to epoll");
+    LOG_ERROR("Failed to add socket to epoll: %s", strerror(errno));
     close(fd);
     return;
   }
 
-  std::printf("[debug] new task: pid=%d\n", optval.pid);
+  LOG_DEBUG("new task: pid=%d\n", optval.pid);
   {
     std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
     ctx->runqueue.emplace_back(optval.pid, fd);
@@ -135,14 +140,14 @@ void poll(Ctx* ctx) {
       ret = epoll_wait(ctx->epoll_fd, &ev, 1, -1);
     } while (ret == -1 && errno == EINTR);
     if (ret == -1) {
-      std::perror("epoll_wait error");
+      LOG_ERROR("epoll_wait error: %s", strerror(errno));
       break;
     }
-    std::printf("[debug] epoll ev = %#x, data: %#x\n", ev.events, ev.data.u32);
+    LOG_DEBUG("epoll ev = %#x, data: %#x\n", ev.events, ev.data.u32);
     if (ev.data.u32 == EPOLL_IDENTIFIER) {
       const int fd = accept(ctx->socket_fd, nullptr, nullptr);
       if (fd < 0) {
-        std::perror("Failed to accept connection");
+        LOG_ERROR("Failed to accept connection: %s", strerror(errno));
         continue;
       }
       add_new_task(ctx, fd);
@@ -162,30 +167,29 @@ void poll(Ctx* ctx) {
       std::lock_guard<std::mutex> rqm(ctx->runqueue_mutex);
       std::lock_guard<std::mutex> pm(ctx->pending_tasks_mutex);
       // TODO: should I check runqueue as well?
-      std::printf(
-          "[error] Failed to find finished task %d from running_tasks\n",
-          ev.data.fd);
+      LOG_ERROR(
+          "Failed to find finished task %d from running_tasks\n", ev.data.fd);
       auto rq_task = std::find_if(
           ctx->runqueue.begin(), ctx->runqueue.end(), [ev](const Task& t) {
             return t.socket_fd() == ev.data.fd;
           });
       if (rq_task != ctx->runqueue.end()) {
-        std::printf(">>> task %ld is on runqueue\n", ev.data.u64);
+        LOG_DEBUG("(debug) task %ld is on runqueue\n", ev.data.u64);
       }
       auto pending_task = std::find_if(ctx->pending_task_per_cpu.begin(),
           ctx->pending_task_per_cpu.end(), [ev](const std::optional<Task>& t) {
             return t.has_value() && t->socket_fd() == ev.data.fd;
           });
       if (pending_task != ctx->pending_task_per_cpu.end()) {
-        std::printf(">>> task %ld is on pending\n", ev.data.u64);
+        LOG_DEBUG("(debug) task %ld is on pending\n", ev.data.u64);
       }
       continue;
     }
-    std::printf("[debug] task finished: fd=%d, task_id=%d\n", ev.data.fd,
-        it->task_id());
+    LOG_DEBUG("task finished: fd=%d, task_id=%d\n", ev.data.fd, it->task_id());
     ctx->running_tasks.erase(it);
     if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, nullptr) < 0) {
-      std::perror("[error] Failed to remove socket from epoll");
+      LOG_ERROR(
+          "[error] Failed to remove socket from epoll: %s", strerror(errno));
     }
     close(ev.data.fd);
   }
@@ -204,15 +208,11 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   if (ctx->runqueue.empty()) {
     return;
   }
-  std::printf(
-      "[debug] enqueue_execute_next_task: next_task_id before renew on cpu %d: "
-      "%d\n",
-      cpu, READ_ONCE(ctx->shm[cpu].next_task_id));
   const pid_t next_task_id = ctx->runqueue.front().task_id();
   pending.emplace(std::move(ctx->runqueue.front()));
   ctx->runqueue.pop_front();
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task_id);
-  std::printf("[info] enqueued task %d at cpu %d\n", next_task_id, cpu);
+  LOG_INFO("enqueued task %d at cpu %d\n", next_task_id, cpu);
 }
 
 void finalize_enqueued_task(Ctx* ctx, int cpu) {
@@ -234,17 +234,17 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
       std::lock_guard<std::mutex> lock_running(ctx->running_tasks_mutex);
       ctx->running_tasks.emplace_back(std::move(*pending));
       pending.reset();
-      std::printf("[info] execution confirmed: task %d on cpu %d\n",
-          requested_task_id, cpu);
+      LOG_INFO(
+          "execution confirmed: task %d on cpu %d\n", requested_task_id, cpu);
     } else {
       // kmodule could not find the target PID, so discard it
       pending.reset();
       if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, requested_fd, nullptr) < 0 &&
           errno != ENOENT && errno != EBADF) {
-        std::perror("[error] Failed to remove discarded task from epoll");
+        LOG_ERROR(
+            "Failed to remove discarded task from epoll: %s", strerror(errno));
       }
-      std::printf(
-          "[warn] discarded task %d on cpu %d because PID was not found\n",
+      LOG_WARN("discarded task %d on cpu %d because PID was not found\n",
           requested_task_id, cpu);
     }
     // always stop finalization when next_task_id was cleared
@@ -260,7 +260,7 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
       ctx->runqueue.emplace_back(std::move(*pending));
     }
     pending.reset();
-    std::printf("[warn] execution failed for task %d on cpu %d; requeued\n",
+    LOG_WARN("execution failed for task %d on cpu %d; requeued\n",
         requested_task_id, cpu);
     return;
   }
@@ -271,8 +271,8 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
     ctx->runqueue.emplace_back(std::move(*pending));
   }
   pending.reset();
-  std::printf(
-      "[warn] inconsistent pending state on cpu %d (pending=%d, next=%d); "
+  LOG_WARN(
+      "inconsistent pending state on cpu %d (pending=%d, next=%d); "
       "requeued\n",
       cpu, requested_task_id, next_task_id);
 }
@@ -285,7 +285,7 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
         return t.task_id() == task_id;
       });
   if (it == ctx->running_tasks.end()) {
-    std::printf("[error] failed to find task %d to park\n", task_id);
+    LOG_ERROR("failed to find task %d to park\n", task_id);
     return;
   }
   {
@@ -293,7 +293,7 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
     ctx->runqueue.splice(ctx->runqueue.end(), ctx->running_tasks, it);
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
-  std::printf("[info] parked task %d on cpu %d\n", task_id, cpu);
+  LOG_INFO("parked task %d on cpu %d\n", task_id, cpu);
 }
 
 void schedule(Ctx* ctx) {
@@ -353,20 +353,20 @@ int main(void) {
                         (t_end.tv_nsec - t_start.tv_nsec);
     const double secs  = static_cast<double>(ns) / 1000.0;
     ctx->cycles_per_us = (end - start) / secs;
-    std::printf("[info] CPU frequency: %.2u cycles/us\n", ctx->cycles_per_us);
+    LOG_INFO("CPU frequency: %.2u cycles/us\n", ctx->cycles_per_us);
   }
 
   // connect to kmodule
   ctx->kmodule_fd = open("/dev/kmodule", O_RDWR);
   if (ctx->kmodule_fd < 0) {
-    std::printf("Failed to open /dev/kmodule (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to open /dev/kmodule (%s)\n", strerror(errno));
     goto delete_ctx;
   }
   ctx->shm = static_cast<SharedContextPerCpu*>(
       mmap(NULL, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN,
           PROT_READ | PROT_WRITE, MAP_SHARED, ctx->kmodule_fd, 0));
   if (ctx->shm == MAP_FAILED) {
-    std::printf("Failed to mmap /dev/kmodule (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to mmap /dev/kmodule (%s)\n", strerror(errno));
     goto close_kmodule_fd;
   }
   std::memset(ctx->shm, 0, sizeof(SharedContextPerCpu) * KMODULE_SHM_ARRAY_LEN);
@@ -378,22 +378,22 @@ int main(void) {
   assert(addr.sun_path[0] == '\0');  // Ensure it's an abstract socket
   ctx->socket_fd = socket(AF_UNIX, SOCK_STREAM, 0);
   if (ctx->socket_fd < 0) {
-    std::printf("Failed to create socket (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to create socket (%s)\n", strerror(errno));
     goto munmap_shm;
   }
   if (bind(ctx->socket_fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) <
       0) {
-    std::printf("Failed to bind socket (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to bind socket (%s)\n", strerror(errno));
     goto close_socket;
   }
   if (listen(ctx->socket_fd, 5) < 0) {
-    std::printf("Failed to listen on socket (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to listen on socket (%s)\n", strerror(errno));
     goto close_socket;
   }
 
   ctx->epoll_fd = epoll_create1(0);
   if (ctx->epoll_fd < 0) {
-    std::printf("Failed to create epoll instance (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to create epoll instance (%s)\n", strerror(errno));
     goto close_socket;
   }
 
@@ -401,13 +401,13 @@ int main(void) {
     // onine list (e.g. "0-3,8")
     std::ifstream online_cpu_file("/sys/devices/system/cpu/online");
     if (!online_cpu_file) {
-      std::printf("[error] Failed to open /sys/devices/system/cpu/online\n");
+      LOG_ERROR("Failed to open /sys/devices/system/cpu/online\n");
       goto close_epoll_fd;
     }
 
     std::string online_cpu_list;
     if (!std::getline(online_cpu_file, online_cpu_list)) {
-      std::printf("[error] Failed to read /sys/devices/system/cpu/online\n");
+      LOG_ERROR("Failed to read /sys/devices/system/cpu/online\n");
       goto close_epoll_fd;
     }
 
@@ -448,8 +448,7 @@ int main(void) {
       const bool has_range = (dash_pos != std::string::npos);
       if (!has_range) {
         if (!parse_uint64_strict(token, &first_cpu)) {
-          std::printf("[error] Failed to parse cpu list: %s\n",
-              online_cpu_list.c_str());
+          LOG_ERROR("Failed to parse cpu list: %s\n", online_cpu_list.c_str());
           goto close_epoll_fd;
         }
         last_cpu = first_cpu;
@@ -457,27 +456,24 @@ int main(void) {
         const auto invalid_extra_dash = token.find('-', dash_pos + 1);
         if (invalid_extra_dash != std::string::npos || dash_pos == 0 ||
             dash_pos + 1 >= token.size()) {
-          std::printf("[error] Failed to parse cpu list: %s\n",
-              online_cpu_list.c_str());
+          LOG_ERROR("Failed to parse cpu list: %s\n", online_cpu_list.c_str());
           goto close_epoll_fd;
         }
         const std::string first_str = token.substr(0, dash_pos);
         const std::string last_str  = token.substr(dash_pos + 1);
         if (!parse_uint64_strict(first_str, &first_cpu) ||
             !parse_uint64_strict(last_str, &last_cpu)) {
-          std::printf("[error] Failed to parse cpu list: %s\n",
-              online_cpu_list.c_str());
+          LOG_ERROR("Failed to parse cpu list: %s\n", online_cpu_list.c_str());
           goto close_epoll_fd;
         }
         if (last_cpu < first_cpu) {
-          std::printf("[error] Failed to parse cpu range: %s\n",
-              online_cpu_list.c_str());
+          LOG_ERROR("Failed to parse cpu range: %s\n", online_cpu_list.c_str());
           goto close_epoll_fd;
         }
       }
 
       if (last_cpu >= KMODULE_SHM_ARRAY_LEN) {
-        std::printf("[error] cpu index out of range: %llu (max=%d)\n",
+        LOG_ERROR("cpu index out of range: %llu (max=%d)\n",
             static_cast<unsigned long long>(last_cpu),
             KMODULE_SHM_ARRAY_LEN - 1);
         goto close_epoll_fd;
@@ -488,12 +484,11 @@ int main(void) {
     }
 
     if (active_cpus.none()) {
-      std::printf(
-          "[error] No online cpu found in /sys/devices/system/cpu/online\n");
+      LOG_ERROR("No online cpu found in /sys/devices/system/cpu/online\n");
       goto close_epoll_fd;
     }
 
-    std::printf("[info] active cpu bitmask=%s (total: %lu)\n",
+    LOG_INFO("active cpu bitmask=%s (total: %lu)\n",
         active_cpus.to_string().c_str(), active_cpus.count());
   }
 
@@ -501,8 +496,7 @@ int main(void) {
   ev.events   = EPOLLIN;
   ev.data.u32 = EPOLL_IDENTIFIER;
   if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, ctx->socket_fd, &ev) < 0) {
-    std::printf(
-        "[error] Failed to add socket to epoll (%s)\n", strerror(errno));
+    LOG_ERROR("Failed to add socket to epoll (%s)\n", strerror(errno));
     goto close_epoll_fd;
   }
 
@@ -511,7 +505,7 @@ int main(void) {
   });
 
   // start scheduling
-  std::puts("[info] Scheduler started");
+  LOG_INFO("Scheduler started\n");
   while (true) {
     schedule(ctx);
     std::this_thread::sleep_for(std::chrono::microseconds(10));
