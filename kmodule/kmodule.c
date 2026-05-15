@@ -13,10 +13,12 @@
 #include <linux/types.h>
 #include <linux/vmalloc.h>
 
-#define LOG_ERROR(fmt, ...) printk(KERN_ERR "[error] " fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  printk(KERN_WARNING "[warn ] " fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  printk(KERN_INFO "[info ] " fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) printk(KERN_DEBUG "[debug] " fmt, ##__VA_ARGS__)
+// clang-format off
+#define LOG_ERROR(fmt, ...) printk(KERN_ERR     "error: " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  printk(KERN_WARNING "warn : " fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  printk(KERN_INFO    "info : " fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) printk(KERN_DEBUG   "debug: " fmt, ##__VA_ARGS__)
+// clang-format on
 
 struct KmoduleContextPerCpu {
   pid_t      last_task_id;
@@ -36,6 +38,11 @@ static void execute_task(
   spin_lock_irqsave(&ctx->execute_task_lock, flags);
 
   if (ctx->running_task) {
+    LOG_WARN(
+        "execution requested CPU %d already have running task (pid: %d); "
+        "removing ("
+        "requested task id: %d)",
+        ctx->running_task->pid, cpu_index, task_id);
     put_task_struct(ctx->running_task);
     ctx->running_task = NULL;
   }
@@ -43,7 +50,7 @@ static void execute_task(
   rcu_read_lock();
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
-    LOG_WARN("failed to find pid (%d)\n", task_id);
+    LOG_ERROR("failed to find pid (%d)\n", task_id);
     rcu_read_unlock();
     spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
     return;
@@ -53,8 +60,10 @@ static void execute_task(
   if (!next || next->on_cpu || next->__state == TASK_WAKING ||
       next->__state == TASK_RUNNING) {
     if (next) {
-      LOG_WARN("pid %d is running (on_cpu: %d, __state: %d)", task_id,
+      LOG_ERROR("pid %d is already running (on_cpu: %d, __state: %d)", task_id,
           next->on_cpu, next->__state);
+    } else {
+      LOG_ERROR("requested task (pid: %d) is not found", task_id);
     }
     rcu_read_unlock();
     spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
@@ -78,8 +87,8 @@ static void start_scheduling(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
-  LOG_DEBUG(
-      "started; pid: %d, current cpu: %d\n", current->pid, smp_processor_id());
+  LOG_DEBUG("scheduling started for pid %d, current cpu: %d\n", current->pid,
+      smp_processor_id());
 }
 static void end_scheduling(void) {
   const int                    cpu = get_cpu();
@@ -126,6 +135,7 @@ static void park_task(void) {
   WRITE_ONCE(shm[cpu].is_park_requested, false);
   WRITE_ONCE(shm[cpu].is_busy, false);
   WRITE_ONCE(shm[cpu].running_task_id, 0);
+  LOG_DEBUG("start parking task on CPU %d", cpu);
   put_cpu();
 
   __set_current_state(TASK_INTERRUPTIBLE);
@@ -210,6 +220,7 @@ static int handle_idle_enter(
     execute_task(ctx, latest_next_task_id, cpu);
   }
   put_cpu();
+  LOG_INFO("(idle handler) end handling on CPU %d", cpu);
   return index;
 }
 
