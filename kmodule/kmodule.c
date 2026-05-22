@@ -42,7 +42,7 @@ static void execute_task(
         "execution requested CPU %d already have running task (pid: %d); "
         "removing ("
         "requested task id: %d)",
-        ctx->running_task->pid, cpu_index, task_id);
+        cpu_index, ctx->running_task->pid, task_id);
     put_task_struct(ctx->running_task);
     ctx->running_task = NULL;
   }
@@ -131,7 +131,10 @@ static void process_ipi_from_scheduler(void) {
 }
 
 static void park_task(void) {
-  const int cpu = get_cpu();
+  const int                    cpu = get_cpu();
+  struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  put_task_struct(ctx->running_task);
+  ctx->running_task = NULL;
   WRITE_ONCE(shm[cpu].is_park_requested, false);
   WRITE_ONCE(shm[cpu].is_busy, false);
   WRITE_ONCE(shm[cpu].running_task_id, 0);
@@ -141,6 +144,8 @@ static void park_task(void) {
   __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
+  LOG_DEBUG("task awaked; pid %d, current cpu: %d\n", current->pid,
+      smp_processor_id());
 }
 
 static long module_ioctl(
