@@ -14,10 +14,10 @@
 #include <linux/vmalloc.h>
 
 // clang-format off
-#define LOG_ERROR(fmt, ...) printk(KERN_ERR     "error: " fmt, ##__VA_ARGS__)
-#define LOG_WARN(fmt, ...)  printk(KERN_WARNING "warn : " fmt, ##__VA_ARGS__)
-#define LOG_INFO(fmt, ...)  printk(KERN_INFO    "info : " fmt, ##__VA_ARGS__)
-#define LOG_DEBUG(fmt, ...) printk(KERN_DEBUG   "debug: " fmt, ##__VA_ARGS__)
+#define LOG_ERROR(fmt, ...) printk(KERN_ERR     "[kmodule] error: " fmt, ##__VA_ARGS__)
+#define LOG_WARN(fmt, ...)  printk(KERN_WARNING "[kmodule] warn : " fmt, ##__VA_ARGS__)
+#define LOG_INFO(fmt, ...)  printk(KERN_INFO    "[kmodule] info : " fmt, ##__VA_ARGS__)
+#define LOG_DEBUG(fmt, ...) printk(KERN_DEBUG   "[kmodule] debug: " fmt, ##__VA_ARGS__)
 // clang-format on
 
 struct KmoduleContextPerCpu {
@@ -133,6 +133,11 @@ static void process_ipi_from_scheduler(void) {
 static void park_task(void) {
   const int                    cpu = get_cpu();
   struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  if (!ctx->running_task) {
+    LOG_ERROR("tried to park but ctx->running_task is NULL (CPU: %d)", cpu);
+    put_cpu();
+    return;
+  }
   put_task_struct(ctx->running_task);
   ctx->running_task = NULL;
   WRITE_ONCE(shm[cpu].is_park_requested, false);
@@ -157,11 +162,11 @@ static long module_ioctl(
     case KMODULE_IOCTL_END:
       end_scheduling();
       break;
-    case KMODULE_IOCTL_INTR:
-      process_ipi_from_scheduler();
-      break;
     case KMODULE_IOCTL_PARK:
       park_task();
+      break;
+    case KMODULE_IOCTL_INTR:
+      process_ipi_from_scheduler();
       break;
   }
   return 0;
