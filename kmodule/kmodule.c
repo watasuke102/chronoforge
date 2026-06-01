@@ -51,9 +51,7 @@ static void execute_task(
   struct pid* pid = find_vpid(task_id);
   if (!pid) {
     LOG_ERROR("failed to find pid (%d)\n", task_id);
-    rcu_read_unlock();
-    spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
-    return;
+    goto err;
   }
   struct task_struct* next = pid_task(pid, PIDTYPE_PID);
   // Failed to find the task or task is already running
@@ -65,9 +63,7 @@ static void execute_task(
     } else {
       LOG_ERROR("requested task (pid: %d) is not found", task_id);
     }
-    rcu_read_unlock();
-    spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
-    return;
+    goto err;
   }
 
   ctx->running_task = next;
@@ -81,6 +77,13 @@ static void execute_task(
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
   LOG_INFO("executed task %d at cpu %d\n", task_id, cpu_index);
   spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
+  return;
+
+err:
+  rcu_read_unlock();
+  spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
+  // re-queue task so that scheduler can detect the execution failure
+  WRITE_ONCE(shm[cpu_index].next_task_id, task_id);
 }
 
 static void start_scheduling(void) {
@@ -122,6 +125,7 @@ static void process_ipi_from_scheduler(void) {
     if (next_task_id != 0 &&
         (ctx->running_task == NULL || ctx->running_task->pid != next_task_id)) {
       if (cmpxchg(&shm[cpu].next_task_id, next_task_id, 0) != next_task_id) {
+        LOG_ERROR("(ipi) cmpxchg() fail on CPU %d", cpu);
         continue;
       }
       LOG_DEBUG("(ipi) switching task %d on cpu %d\n", next_task_id, cpu);
@@ -223,6 +227,7 @@ static int handle_idle_enter(
   if (latest_next_task_id != 0 && latest_next_task_id != ctx->last_task_id) {
     if (cmpxchg(&shm[cpu].next_task_id, latest_next_task_id, 0) !=
         latest_next_task_id) {
+      LOG_ERROR("(idle handler) cmpxchg() fail on CPU %d", cpu);
       put_cpu();
       return index;
     }
