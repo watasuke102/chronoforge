@@ -24,6 +24,7 @@
 #include <sstream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 
 #include "kmodule.h"
 
@@ -81,7 +82,6 @@ class Task {
 struct CoreState {
   std::optional<Task> running_task;
   std::optional<Task> execution_requested_task;
-  std::optional<Task> park_requested_task;
 };
 
 // Context that shared between scheduling thread and socket thread
@@ -95,8 +95,10 @@ struct Ctx {
 
   std::list<Task>                              runqueue;
   std::array<CoreState, KMODULE_SHM_ARRAY_LEN> core_states;
+  std::unordered_map<pid_t, Task>              park_pending_tasks;
   std::mutex                                   runqueue_mutex;
   std::mutex                                   core_states_mutex;
+  std::mutex                                   park_pending_mutex;
 };
 
 namespace {
@@ -217,10 +219,11 @@ void enqueue_park_task(Ctx* ctx, int cpu) {
     return;
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
-  LOG_INFO("park enqueued for task %d at cpu %d\n",
-      ctx->core_states[cpu].running_task->task_id(), cpu);
-  ctx->core_states[cpu].park_requested_task =
-      std::move(ctx->core_states[cpu].running_task);
+  auto pid = ctx->core_states[cpu].running_task->task_id();
+  LOG_INFO("park enqueued for task %d at cpu %d\n", pid, cpu);
+  std::lock_guard<std::mutex> lock_park_pending(ctx->park_pending_mutex);
+  ctx->park_pending_tasks.emplace(
+      pid, std::move(ctx->core_states[cpu].running_task.value()));
   ctx->core_states[cpu].running_task.reset();
 }
 
@@ -283,13 +286,40 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
         "inconsistent pending state on cpu %d (pending=%d, next=%d); "
         "requeued\n",
         cpu, requested_task_id, next_task_id);
-  } else if (core_state.park_requested_task.has_value()) {
-    auto& pending = core_state.park_requested_task;
-    LOG_INFO(
-        "execution confirmed: task %d on cpu %d\n", pending->task_id(), cpu);
-    std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-    ctx->runqueue.emplace_back(std::move(*pending));
-    pending.reset();
+  }
+  // else if (core_state.park_requested_task.has_value()) {
+  //   auto& pending = core_state.park_requested_task;
+  //   LOG_INFO(
+  //       "execution confirmed: task %d on cpu %d\n", pending->task_id(), cpu);
+  //   std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+  //   ctx->runqueue.emplace_back(std::move(*pending));
+  //   pending.reset();
+  // }
+}
+
+void finalize_parked_tasks(Ctx* ctx) {
+  for (int cpu = 0; cpu < KMODULE_SHM_ARRAY_LEN; cpu++) {
+    if (!active_cpus.test(cpu)) {
+      continue;
+    }
+    pid_t parked_pid = READ_ONCE(ctx->shm[cpu].parked_task_id);
+    if (parked_pid == 0) {
+      continue;
+    }
+    LOG_INFO("Recognized: task %d is parked by kmodule on cpu %d\n", parked_pid,
+        cpu);
+    // Move the task from park_pending_tasks back to runqueue
+    std::lock_guard<std::mutex> lock_park_pending(ctx->park_pending_mutex);
+    auto                        it = ctx->park_pending_tasks.find(parked_pid);
+    if (it != ctx->park_pending_tasks.end()) {
+      std::lock_guard<std::mutex> lock_rq(ctx->runqueue_mutex);
+      ctx->runqueue.emplace_back(std::move(it->second));
+      ctx->park_pending_tasks.erase(it);
+    } else {
+      LOG_WARN("Parked task %d not found in park_pending_tasks\n", parked_pid);
+    }
+    // Clear the notification flag in shm
+    WRITE_ONCE(ctx->shm[cpu].parked_task_id, 0);
   }
 }
 
@@ -331,6 +361,9 @@ void schedule(Ctx* ctx) {
     }
     finalize_enqueued_task(ctx, i);
   }
+
+  // Check and finalize parked tasks
+  finalize_parked_tasks(ctx);
 }
 }  // namespace
 

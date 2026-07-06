@@ -26,6 +26,8 @@ struct SharedContextPerCpu {
   pid_t    next_task_id;
   // written by kmodule
   pid_t    running_task_id;
+  // written by kmodule when a task is parked
+  pid_t    parked_task_id;
 };
 
 #define KMODULE_SHM_ARRAY_LEN 256

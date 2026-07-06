@@ -1,3 +1,5 @@
+#include <unistd.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -7,7 +9,8 @@
 
 namespace {
 int task(void* /*arg*/) {
-  std::puts("[info ] initialized");
+  pid_t pid = getpid();
+  std::printf("[info |%05d] initialized\n", pid);
 
   int      passed_sec = 0;
   timespec t_start, t_end, t_now;
@@ -16,14 +19,15 @@ int task(void* /*arg*/) {
     clock_gettime(CLOCK_MONOTONIC_RAW, &t_now);
     if ((t_now.tv_sec - t_start.tv_sec) >= (passed_sec + 1)) {
       passed_sec++;
-      std::printf("[debug] waited: %d sec (real: %ld sec)\n", passed_sec,
-          (t_now.tv_sec - t_start.tv_sec));
+      std::printf("[debug|%5d] waited: %d sec (real: %ld sec)\n", pid,
+          passed_sec, (t_now.tv_sec - t_start.tv_sec));
     }
     // std::this_thread::sleep_for(std::chrono::nanoseconds(100));
   }
   clock_gettime(CLOCK_MONOTONIC_RAW, &t_end);
 
-  std::printf("[info ] elapsed time: %ld sec\n", t_end.tv_sec - t_start.tv_sec);
+  std::printf("[info |%5d] elapsed time: %ld sec\n", pid,
+      t_end.tv_sec - t_start.tv_sec);
   return EXIT_SUCCESS;
 }
 }  // namespace

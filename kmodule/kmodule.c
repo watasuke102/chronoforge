@@ -99,7 +99,7 @@ static void end_scheduling(void) {
   LOG_INFO("task finished: cpu=%d, pid=%d, running_task: %p\n", cpu,
       shm[cpu].running_task_id, ctx->running_task);
   if (!ctx || !ctx->running_task) {
-    LOG_WARN("ctx or running_task is NULL\n");
+    LOG_WARN("ctx or running_task is NULL at end_scheduling()\n");
     put_cpu();
     return;
   }
@@ -142,11 +142,13 @@ static void park_task(void) {
     put_cpu();
     return;
   }
+  pid_t pid = ctx->running_task->pid;
   put_task_struct(ctx->running_task);
   ctx->running_task = NULL;
   WRITE_ONCE(shm[cpu].is_park_requested, false);
   WRITE_ONCE(shm[cpu].is_busy, false);
   WRITE_ONCE(shm[cpu].running_task_id, 0);
+  WRITE_ONCE(shm[cpu].parked_task_id, pid);
   LOG_DEBUG("start parking task on CPU %d", cpu);
   put_cpu();
 
