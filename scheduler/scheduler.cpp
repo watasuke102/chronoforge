@@ -331,20 +331,22 @@ void schedule(Ctx* ctx) {
     if (!active_cpus.test(i)) {
       continue;
     }
+    if (READ_ONCE(ctx->shm[i].is_park_requested)) {
+      return;
+    }
     uint32_t runqueue_size = 0;
     {
       std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
       runqueue_size = ctx->runqueue.size();
     }
     if (READ_ONCE(ctx->shm[i].running_task_id) != 0) {
-      // task is running; check time slice
+      // task is running and park is not requested; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
       // time slice exceeded
       if (runqueue_size > 0 &&
           now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
         // request to park the task and schedule the next task
         enqueue_park_task(ctx, i);
-        enqueue_execute_next_task(ctx, i);
       }
     } else if (runqueue_size > 0) {
       // cpu is idle; schedule the next task
