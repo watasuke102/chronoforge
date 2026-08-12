@@ -309,7 +309,7 @@ void schedule(Ctx* ctx) {
       continue;
     }
     if (READ_ONCE(ctx->shm[i].is_park_requested)) {
-      return;
+      continue;
     }
     uint32_t runqueue_size = 0;
     {

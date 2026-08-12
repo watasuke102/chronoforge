@@ -113,11 +113,19 @@ static void process_ipi_from_scheduler(void) {
   int cpu = 0;
   for_each_online_cpu(cpu) {
     struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
-    if (ctx->running_task && READ_ONCE(shm[cpu].is_park_requested)) {
-      LOG_DEBUG("(ipi) accept parking request for task %d on cpu %d\n",
-          ctx->running_task->pid, cpu);
-      // just send signal, actual park request is sent from runtime via ioctl()
-      send_sig(SIGUSR1, ctx->running_task, 0);
+    if (READ_ONCE(shm[cpu].is_park_requested)) {
+      if (ctx->running_task) {
+        LOG_DEBUG("(ipi) accept parking request for task %d on cpu %d\n",
+            ctx->running_task->pid, cpu);
+        // just send signal
+        // actual park request is sent from runtime via ioctl()
+        send_sig(SIGUSR1, ctx->running_task, 0);
+      } else {
+        LOG_ERROR(
+            "(ipi) park requested for cpu %d but there is no task"
+            "on that cpu\n",
+            cpu);
+      }
       WRITE_ONCE(shm[cpu].is_park_requested, false);
       continue;
     }
