@@ -96,9 +96,7 @@ struct Ctx {
   std::list<Task>                              runqueue;
   std::array<CoreState, KMODULE_SHM_ARRAY_LEN> core_states;
   std::unordered_map<pid_t, Task>              park_pending_tasks;
-  std::mutex                                   runqueue_mutex;
-  std::mutex                                   core_states_mutex;
-  std::mutex                                   park_pending_mutex;
+  std::mutex                                   mutex;
 };
 
 namespace {
@@ -131,7 +129,7 @@ void add_new_task(Ctx* ctx, int fd) {
 
   LOG_DEBUG("new task: pid=%d\n", optval.pid);
   {
-    std::lock_guard<std::mutex> lock(ctx->runqueue_mutex);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
     ctx->runqueue.emplace_back(optval.pid, fd);
   }
 }
@@ -164,14 +162,13 @@ void poll(Ctx* ctx) {
     }
     // task finished
     // task is expected to be in running_tasks
-    std::lock_guard<std::mutex> lock_core_states(ctx->core_states_mutex);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
     auto it = std::find_if(ctx->core_states.begin(), ctx->core_states.end(),
         [ev](const CoreState& s) {
           return s.running_task.has_value() &&
                  s.running_task->task_id() == ev.data.u64;
         });
     if (it == ctx->core_states.end()) {
-      std::lock_guard<std::mutex> rqm(ctx->runqueue_mutex);
       LOG_ERROR(
           "Failed to find finished task %d from running_tasks\n", ev.data.fd);
       auto rq_task = std::find_if(
@@ -197,7 +194,7 @@ void poll(Ctx* ctx) {
 /// Take a task from runqueue and request kmodule to execute the next task
 /// If there is no task in the runqueue, do nothing
 void enqueue_execute_next_task(Ctx* ctx, int cpu) {
-  std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+  std::lock_guard<std::mutex> lock(ctx->mutex);
   if (ctx->runqueue.empty()) {
     return;
   }
@@ -206,29 +203,24 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task.task_id());
   LOG_INFO(
       "execution enqueued for task %d at cpu %d\n", next_task.task_id(), cpu);
-  {
-    std::lock_guard<std::mutex> lock_core_status(ctx->core_states_mutex);
-    ctx->core_states[cpu].execution_requested_task.emplace(
-        std::move(next_task));
-  }
+  ctx->core_states[cpu].execution_requested_task.emplace(std::move(next_task));
 }
 /// Request kmodule to park the currently running task on the specified CPU
 void enqueue_park_task(Ctx* ctx, int cpu) {
-  std::lock_guard<std::mutex> lock_core_status(ctx->core_states_mutex);
+  std::lock_guard<std::mutex> lock(ctx->mutex);
   if (!ctx->core_states[cpu].running_task.has_value()) {
     return;
   }
   WRITE_ONCE(ctx->shm[cpu].is_park_requested, true);
   auto pid = ctx->core_states[cpu].running_task->task_id();
   LOG_INFO("park enqueued for task %d at cpu %d\n", pid, cpu);
-  std::lock_guard<std::mutex> lock_park_pending(ctx->park_pending_mutex);
   ctx->park_pending_tasks.emplace(
       pid, std::move(ctx->core_states[cpu].running_task.value()));
   ctx->core_states[cpu].running_task.reset();
 }
 
 void finalize_enqueued_task(Ctx* ctx, int cpu) {
-  std::lock_guard<std::mutex> lock_core_status(ctx->core_states_mutex);
+  std::lock_guard<std::mutex> lock(ctx->mutex);
   auto&                       core_state = ctx->core_states[cpu];
 
   if (core_state.execution_requested_task.has_value()) {
@@ -266,10 +258,7 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
       // kmodule kept next_task_id unchanged, so execution failed for a reason
       // other than missing PID. Return the task to runqueue and retry later
       WRITE_ONCE(ctx->shm[cpu].next_task_id, 0);
-      {
-        std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-        ctx->runqueue.emplace_back(std::move(*pending));
-      }
+      ctx->runqueue.emplace_back(std::move(*pending));
       pending.reset();
       LOG_WARN("execution failed for task %d on cpu %d; requeued\n",
           requested_task_id, cpu);
@@ -277,24 +266,13 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
     }
 
     // Unexpected failure; requeue the task
-    {
-      std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-      ctx->runqueue.emplace_back(std::move(*pending));
-    }
+    ctx->runqueue.emplace_back(std::move(*pending));
     pending.reset();
     LOG_WARN(
         "inconsistent pending state on cpu %d (pending=%d, next=%d); "
         "requeued\n",
         cpu, requested_task_id, next_task_id);
   }
-  // else if (core_state.park_requested_task.has_value()) {
-  //   auto& pending = core_state.park_requested_task;
-  //   LOG_INFO(
-  //       "execution confirmed: task %d on cpu %d\n", pending->task_id(), cpu);
-  //   std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
-  //   ctx->runqueue.emplace_back(std::move(*pending));
-  //   pending.reset();
-  // }
 }
 
 void finalize_parked_tasks(Ctx* ctx) {
@@ -309,10 +287,9 @@ void finalize_parked_tasks(Ctx* ctx) {
     LOG_INFO("Recognized: task %d is parked by kmodule on cpu %d\n", parked_pid,
         cpu);
     // Move the task from park_pending_tasks back to runqueue
-    std::lock_guard<std::mutex> lock_park_pending(ctx->park_pending_mutex);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
     auto                        it = ctx->park_pending_tasks.find(parked_pid);
     if (it != ctx->park_pending_tasks.end()) {
-      std::lock_guard<std::mutex> lock_rq(ctx->runqueue_mutex);
       ctx->runqueue.emplace_back(std::move(it->second));
       ctx->park_pending_tasks.erase(it);
     } else {
@@ -336,7 +313,7 @@ void schedule(Ctx* ctx) {
     }
     uint32_t runqueue_size = 0;
     {
-      std::lock_guard<std::mutex> lock_runqueue(ctx->runqueue_mutex);
+      std::lock_guard<std::mutex> lock(ctx->mutex);
       runqueue_size = ctx->runqueue.size();
     }
     if (READ_ONCE(ctx->shm[i].running_task_id) != 0) {
