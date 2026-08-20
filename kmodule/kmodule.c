@@ -71,6 +71,7 @@ static void execute_task(
 
   ctx->last_task_id = task_id;
   WRITE_ONCE(shm[cpu_index].is_busy, true);
+  WRITE_ONCE(shm[cpu_index].task_started_at, 0);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
   LOG_INFO("executed task %d at cpu %d\n", task_id, cpu_index);
   return;

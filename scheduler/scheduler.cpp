@@ -238,6 +238,9 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
         pending.reset();
         LOG_INFO(
             "execution confirmed: task %d on cpu %d\n", requested_task_id, cpu);
+      } else if (running_task_id == 0) {
+        // kmodule execute_task is still running, wait for it to finish
+        return;
       } else {
         // kmodule could not find the target PID, so discard it
         pending.reset();
@@ -320,7 +323,7 @@ void schedule(Ctx* ctx) {
       // task is running and park is not requested; check time slice
       const auto task_started_at = READ_ONCE(ctx->shm[i].task_started_at);
       // time slice exceeded
-      if (runqueue_size > 0 &&
+      if (task_started_at != 0 && runqueue_size > 0 &&
           now - task_started_at > ctx->cycles_per_us * TASK_QUANTUM_US) {
         // request to park the task and schedule the next task
         enqueue_park_task(ctx, i);
