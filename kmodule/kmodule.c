@@ -22,7 +22,7 @@
 
 struct KmoduleContextPerCpu {
   pid_t      last_task_id;
-  spinlock_t execute_task_lock;
+  spinlock_t running_task_lock;
 
   // basically managed by execute_task()
   // but finally released by module_cleanup()
@@ -34,9 +34,6 @@ struct SharedContextPerCpu* shm;
 
 static void execute_task(
     struct KmoduleContextPerCpu* ctx, pid_t task_id, int cpu_index) {
-  unsigned long flags;
-  spin_lock_irqsave(&ctx->execute_task_lock, flags);
-
   if (ctx->running_task) {
     LOG_WARN(
         "execution requested CPU %d already have running task (pid: %d); "
@@ -76,12 +73,10 @@ static void execute_task(
   WRITE_ONCE(shm[cpu_index].is_busy, true);
   WRITE_ONCE(shm[cpu_index].running_task_id, task_id);
   LOG_INFO("executed task %d at cpu %d\n", task_id, cpu_index);
-  spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
   return;
 
 err:
   rcu_read_unlock();
-  spin_unlock_irqrestore(&ctx->execute_task_lock, flags);
   // re-queue task so that scheduler can detect the execution failure
   WRITE_ONCE(shm[cpu_index].next_task_id, task_id);
 }
@@ -96,15 +91,19 @@ static void start_scheduling(void) {
 static void end_scheduling(void) {
   const int                    cpu = get_cpu();
   struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  unsigned long                flags;
+  spin_lock_irqsave(&ctx->running_task_lock, flags);
   LOG_INFO("task finished: cpu=%d, pid=%d, running_task: %p\n", cpu,
       shm[cpu].running_task_id, ctx->running_task);
   if (!ctx || !ctx->running_task) {
     LOG_WARN("ctx or running_task is NULL at end_scheduling()\n");
     put_cpu();
+    spin_unlock_irqrestore(&ctx->running_task_lock, flags);
     return;
   }
   put_task_struct(ctx->running_task);
   ctx->running_task = NULL;
+  spin_unlock_irqrestore(&ctx->running_task_lock, flags);
   WRITE_ONCE(shm[cpu].running_task_id, 0);
   put_cpu();
 }
@@ -113,6 +112,8 @@ static void process_ipi_from_scheduler(void) {
   int cpu = 0;
   for_each_online_cpu(cpu) {
     struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
+    unsigned long                flags;
+    spin_lock_irqsave(&ctx->running_task_lock, flags);
     if (READ_ONCE(shm[cpu].is_park_requested)) {
       if (ctx->running_task) {
         LOG_DEBUG("(ipi) accept parking request for task %d on cpu %d\n",
@@ -127,6 +128,7 @@ static void process_ipi_from_scheduler(void) {
             cpu);
       }
       WRITE_ONCE(shm[cpu].is_park_requested, false);
+      spin_unlock_irqrestore(&ctx->running_task_lock, flags);
       continue;
     }
     pid_t next_task_id = READ_ONCE(shm[cpu].next_task_id);
@@ -134,19 +136,24 @@ static void process_ipi_from_scheduler(void) {
         (ctx->running_task == NULL || ctx->running_task->pid != next_task_id)) {
       if (cmpxchg(&shm[cpu].next_task_id, next_task_id, 0) != next_task_id) {
         LOG_ERROR("(ipi) cmpxchg() fail on CPU %d", cpu);
+        spin_unlock_irqrestore(&ctx->running_task_lock, flags);
         continue;
       }
       LOG_DEBUG("(ipi) switching task %d on cpu %d\n", next_task_id, cpu);
       execute_task(ctx, next_task_id, cpu);
     }
+    spin_unlock_irqrestore(&ctx->running_task_lock, flags);
   }
 }
 
 static void park_task(void) {
   const int                    cpu = get_cpu();
   struct KmoduleContextPerCpu* ctx = this_cpu_ptr(&cpu_local_ctx);
+  unsigned long                flags;
+  spin_lock_irqsave(&ctx->running_task_lock, flags);
   if (!ctx->running_task) {
     LOG_ERROR("tried to park but ctx->running_task is NULL (CPU: %d)", cpu);
+    spin_unlock_irqrestore(&ctx->running_task_lock, flags);
     put_cpu();
     return;
   }
@@ -155,11 +162,14 @@ static void park_task(void) {
   ctx->running_task = NULL;
   WRITE_ONCE(shm[cpu].is_busy, false);
   WRITE_ONCE(shm[cpu].running_task_id, 0);
+
+  set_current_state(TASK_INTERRUPTIBLE);
+
   WRITE_ONCE(shm[cpu].parked_task_id, pid);
   LOG_DEBUG("start parking task on CPU %d", cpu);
+  spin_unlock_irqrestore(&ctx->running_task_lock, flags);
   put_cpu();
 
-  __set_current_state(TASK_INTERRUPTIBLE);
   schedule();
   __set_current_state(TASK_RUNNING);
   LOG_DEBUG("task awaked; pid %d, current cpu: %d\n", current->pid,
@@ -342,7 +352,7 @@ static int         module_entry(void) {
     int cpu;
     for_each_online_cpu(cpu) {
       struct KmoduleContextPerCpu* ctx = per_cpu_ptr(&cpu_local_ctx, cpu);
-      spin_lock_init(&ctx->execute_task_lock);
+      spin_lock_init(&ctx->running_task_lock);
     }
   }
 
