@@ -44,25 +44,28 @@ class Task {
   Task(const Task&)            = delete;
   Task& operator=(const Task&) = delete;
   Task(Task&& other) noexcept
-      : task_id_(other.task_id_), socket_fd_(other.socket_fd_) {
+      : task_id_(other.task_id_)
+      , socket_fd_(other.socket_fd_)
+      , finished_(other.finished_) {
     other.task_id_   = 0;
-    other.socket_fd_ = 0;
+    other.socket_fd_ = -1;
   }
   Task& operator=(Task&& other) noexcept {
     if (this == &other) {
       return *this;
     }
-    if (socket_fd_ != 0) {
+    if (socket_fd_ >= 0) {
       close(socket_fd_);
     }
     task_id_         = other.task_id_;
     socket_fd_       = other.socket_fd_;
+    finished_        = other.finished_;
     other.task_id_   = 0;
-    other.socket_fd_ = 0;
+    other.socket_fd_ = -1;
     return *this;
   }
   ~Task() {
-    if (socket_fd_ != 0) {
+    if (socket_fd_ >= 0) {
       close(socket_fd_);
     }
   }
@@ -73,10 +76,17 @@ class Task {
   int socket_fd() const {
     return socket_fd_;
   }
+  bool finished() const {
+    return finished_;
+  }
+  void mark_finished() {
+    finished_ = true;
+  }
 
  private:
   pid_t task_id_;
   int   socket_fd_;
+  bool  finished_ = false;
 };
 
 struct CoreState {
@@ -118,7 +128,7 @@ void add_new_task(Ctx* ctx, int fd) {
     return;
   }
 
-  struct epoll_event ev;
+  struct epoll_event ev{};
   ev.events  = EPOLLIN;
   ev.data.fd = fd;
   if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_ADD, fd, &ev) < 0) {
@@ -134,7 +144,39 @@ void add_new_task(Ctx* ctx, int fd) {
   }
 }
 
-// Poll incoming connections from clients
+// Release disconnected tasks, including those that finish before confirmation
+void remove_finished_task(Ctx* ctx, int fd) {
+  std::lock_guard<std::mutex> lock(ctx->mutex);
+  // Deregister before releasing the fd: another thread can immediately reuse
+  // its number in accept()
+  if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, fd, nullptr) < 0 &&
+      errno != ENOENT && errno != EBADF) {
+    LOG_ERROR("Failed to remove socket from epoll: %s\n", strerror(errno));
+  }
+  ctx->runqueue.remove_if([fd](const Task& task) {
+    return task.socket_fd() == fd;
+  });
+  for (auto& state : ctx->core_states) {
+    if (state.running_task && state.running_task->socket_fd() == fd) {
+      state.running_task.reset();
+    }
+    if (state.execution_requested_task &&
+        state.execution_requested_task->socket_fd() == fd) {
+      // Do not lose ownership of a request that the kernel is still handling
+      state.execution_requested_task->mark_finished();
+    }
+  }
+  for (auto it = ctx->park_pending_tasks.begin();
+      it != ctx->park_pending_tasks.end();) {
+    if (it->second.socket_fd() == fd) {
+      it = ctx->park_pending_tasks.erase(it);
+    } else {
+      ++it;
+    }
+  }
+}
+
+// Poll incoming connections and disconnects from clients.
 void poll(Ctx* ctx) {
   int                ret;
   struct epoll_event ev;
@@ -160,34 +202,7 @@ void poll(Ctx* ctx) {
     if ((ev.events & EPOLLHUP) == 0) {
       continue;
     }
-    // task finished
-    // task is expected to be in running_tasks
-    std::lock_guard<std::mutex> lock(ctx->mutex);
-    auto it = std::find_if(ctx->core_states.begin(), ctx->core_states.end(),
-        [ev](const CoreState& s) {
-          return s.running_task.has_value() &&
-                 s.running_task->task_id() == ev.data.u64;
-        });
-    if (it == ctx->core_states.end()) {
-      LOG_ERROR(
-          "Failed to find finished task %d from running_tasks\n", ev.data.fd);
-      auto rq_task = std::find_if(
-          ctx->runqueue.begin(), ctx->runqueue.end(), [ev](const Task& t) {
-            return t.socket_fd() == ev.data.fd;
-          });
-      if (rq_task != ctx->runqueue.end()) {
-        LOG_DEBUG("(debug) task %ld is on runqueue\n", ev.data.u64);
-      }
-      continue;
-    }
-    LOG_DEBUG("task finished: fd=%d, task_id=%d\n", ev.data.fd,
-        it->running_task->task_id());
-    it->running_task.reset();
-    if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, ev.data.fd, nullptr) < 0) {
-      LOG_ERROR(
-          "[error] Failed to remove socket from epoll: %s", strerror(errno));
-    }
-    close(ev.data.fd);
+    remove_finished_task(ctx, ev.data.fd);
   }
 }
 
@@ -195,7 +210,8 @@ void poll(Ctx* ctx) {
 /// If there is no task in the runqueue, do nothing
 void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   std::lock_guard<std::mutex> lock(ctx->mutex);
-  if (ctx->runqueue.empty()) {
+  if (ctx->runqueue.empty() ||
+      ctx->core_states[cpu].execution_requested_task.has_value()) {
     return;
   }
   auto next_task = std::move(ctx->runqueue.front());
@@ -232,7 +248,9 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
 
     // execution request was confirmed
     if (next_task_id == 0) {
-      if (running_task_id == requested_task_id) {
+      if (pending->finished()) {
+        pending.reset();
+      } else if (running_task_id == requested_task_id) {
         // the task was successfully executed
         core_state.running_task = std::move(pending);
         pending.reset();
@@ -243,13 +261,13 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
         return;
       } else {
         // kmodule could not find the target PID, so discard it
-        pending.reset();
         if (epoll_ctl(ctx->epoll_fd, EPOLL_CTL_DEL, requested_fd, nullptr) <
                 0 &&
             errno != ENOENT && errno != EBADF) {
           LOG_ERROR("Failed to remove discarded task from epoll: %s",
               strerror(errno));
         }
+        pending.reset();
         LOG_WARN("discarded task %d on cpu %d because PID was not found\n",
             requested_task_id, cpu);
       }
@@ -261,6 +279,10 @@ void finalize_enqueued_task(Ctx* ctx, int cpu) {
       // kmodule kept next_task_id unchanged, so execution failed for a reason
       // other than missing PID. Return the task to runqueue and retry later
       WRITE_ONCE(ctx->shm[cpu].next_task_id, 0);
+      if (pending->finished()) {
+        pending.reset();
+        return;
+      }
       ctx->runqueue.emplace_back(std::move(*pending));
       pending.reset();
       LOG_WARN("execution failed for task %d on cpu %d; requeued\n",

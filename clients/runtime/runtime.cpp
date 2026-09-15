@@ -17,7 +17,6 @@ int kmodule_fd = -1;
 
 // handle SIGUSR1 (park request)
 void handle_sigusr1(int signum) {
-  std::putchar('.');  // debug
   ioctl(kmodule_fd, KMODULE_IOCTL_PARK);
 }
 }  // namespace
