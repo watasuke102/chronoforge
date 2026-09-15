@@ -198,7 +198,7 @@ void enqueue_execute_next_task(Ctx* ctx, int cpu) {
   if (ctx->runqueue.empty()) {
     return;
   }
-  auto&& next_task = std::move(ctx->runqueue.front());
+  auto next_task = std::move(ctx->runqueue.front());
   ctx->runqueue.pop_front();
   WRITE_ONCE(ctx->shm[cpu].next_task_id, next_task.task_id());
   LOG_INFO(
